@@ -21,7 +21,7 @@ PORT=${PORT:-18024}
 # The two 64 GB cards, by index or UUID (`nvidia-smi -L`). Keep smaller cards out
 # of the group: TP caps every rank at the smallest card.
 GPUS=${GPUS:?set GPUS to the two CMP 170HX devices, e.g. GPUS=1,2 or their UUIDs}
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-262144}   # the model's native maximum; a 200K-token needle was found (README)
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}   # 4 concurrent streams: 333 tok/s aggregate vs 127 for one
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-1024}   # 4096 returned HTTP 500 on a 7K-token prefill
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}

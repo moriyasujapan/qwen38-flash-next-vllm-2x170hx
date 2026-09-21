@@ -5,8 +5,9 @@
 Serving **Qwen3.8-Flash-Next** (W4A16) on two **NVIDIA CMP 170HX** mining cards with vLLM,
 on a host with **92 GiB of RAM** — less than the published recipes ask for.
 
-**~100–115 tok/s on prose, ~175 tok/s on code, single stream · 333 tok/s aggregate at
-4 concurrent · 1,058,505 KV tokens · 65K context · tool calling.**
+**~100–110 tok/s on prose, ~170 tok/s on code, single stream · ~390 tok/s aggregate at
+4 concurrent · 262,144-token context (the model's native maximum; a 200K-token needle is
+found) · 1,486,412 KV tokens · tool calling.**
 
 Every number on this page was measured on this machine; how is in [Method](#method), and
 the raw results are in `results/`.
@@ -46,8 +47,9 @@ yours with `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current
 
 ## Results
 
-Default configuration: MTP k=4, `--max-num-seqs 8`, `--max-num-batched-tokens 1024`,
-BF16 KV, `--kv-cache-memory` sized to fill the card.
+Default configuration: `--max-model-len 262144`, MTP k=4, `--max-num-seqs 8`,
+`--max-num-batched-tokens 1024`, BF16 KV, `--kv-cache-memory` sized to fill the card.
+Rows marked 64K were measured with `--max-model-len 65536`, before the default moved.
 
 ### Decode, single stream (tok/s, median of 3, 512 max tokens)
 
@@ -56,8 +58,9 @@ BF16 KV, `--kv-cache-memory` sized to fill the card.
 | no MTP | 65.8 | 65.9 | 64.9 | 66.5 |
 | MTP k=2 | 105.3 | 102.2 | 101.2 | 133.6 |
 | MTP k=3 | 105.9 | 104.6 | 111.1 | 156.5 |
-| MTP k=4, `max-num-seqs 1` | 99.6 | 100.9 | 104.9 | 182.0 |
-| **MTP k=4, `max-num-seqs 8` (default)** | **104.5** | **101.1** | **114.0** | **173.0** |
+| MTP k=4, `max-num-seqs 1` (64K) | 99.6 | 100.9 | 104.9 | 182.0 |
+| MTP k=4, `max-num-seqs 8` (64K) | 104.5 | 101.1 | 114.0 | 173.0 |
+| **MTP k=4, `max-num-seqs 8`, 262K context (default)** | **101.3** | **97.8** | **107.7** | **170.0** |
 
 MTP is worth ~1.6× on prose and ~2.6× on code. Larger k helps code (predictable tokens)
 and makes no difference to prose. The min–max spread within a cell is typically ±5–10%.
@@ -66,14 +69,23 @@ and makes no difference to prose. The min–max spread within a cell is typicall
 
 | concurrent requests | 1 | 4 | 8 |
 |---|---|---|---|
-| `max-num-seqs 1` | 127 | 126 (queued) | – |
-| **`max-num-seqs 8`** | 127 | **333** | 302 |
+| `max-num-seqs 1` (64K) | 127 | 126 (queued) | – |
+| `max-num-seqs 8` (64K) | 127 | 333 | 302 |
+| **`max-num-seqs 8`, 262K context (default)** | 126 | **392** | 387 |
 
 ### Prefill (prompt tok/s, prefix cache defeated with a random nonce)
 
 | prompt | 6,954 tokens | 27,853 tokens |
 |---|---|---|
-| default | 2,637 | 3,068 |
+| 64K | 2,637 | 3,068 |
+| 262K context (default) | 3,191 | 3,261 |
+
+### Long context
+
+A 200,087-token chat prompt with a random code planted at 24% depth: the code was
+returned correctly, time to first token 70.5 s (2,839 tok/s prefill), then 69.0 tok/s
+decode at that depth. A repeated prefix is served from the prefix cache, so only the
+first pass over a long document pays the prefill.
 
 ### Things that did not help
 
@@ -102,7 +114,8 @@ layer has no entry in alesha-pro's file, so calibrating here was necessary.
 
 Retrieval matched BF16 (no run failed to find the needle; the misses were the model
 declining to reveal a "vault override code"). But decode is slower and the extra capacity
-is not needed: BF16 already holds eight concurrent 65K contexts twice over. Default stays BF16.
+is not needed: BF16 already holds 5.67 full 262K contexts. Default stays BF16. (The FP8 run
+used `--max-model-len 65536`.)
 
 ### Long-form output
 
@@ -116,7 +129,7 @@ know and filled a comparison table with unsourced numbers — verify specifics.
 | | per card | total |
 |---|---|---|
 | weights + non-torch (incl. MTP head) | 38.7 GiB | 77.4 GiB |
-| KV cache (BF16) | 22.7 GiB | 45.4 GiB → 1,058,505 tokens |
+| KV cache (BF16) | 22.7 GiB | 45.4 GiB → 1,486,412 tokens at 262K context |
 | host RAM, whole container | – | 61.2 GiB (PLE worker 48.4 GiB) |
 
 Startup takes about **5 min 50 s**: main weights 103 s, MTP drafter 9 s, FP8 PLE ~40 s,
@@ -176,7 +189,8 @@ an optional LiteLLM front end. Every path and setting is an environment variable
 |---|---|---|
 | `--tensor-parallel-size 2 --enable-expert-parallel` | required | 640/2 is not divisible by the group size 128 |
 | `--speculative-config` | MTP, k=4 | fastest on code, equal on prose (table above) |
-| `--max-num-seqs` | 8 | 2.6× aggregate at 4 concurrent; single stream unchanged |
+| `--max-model-len` | 262144 | the model's native maximum; raising it did not slow short requests |
+| `--max-num-seqs` | 8 | ~3× aggregate at 4 concurrent; single stream unchanged |
 | `--max-num-batched-tokens` | 1024 | 4096 returned HTTP 500 on a 7K prefill |
 | `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductor gains nothing here; FULL is downgraded |
 | `--kv-cache-memory` | 24383208960 | fills a 64 GB card; the fraction-based default left 4.35 GiB per card idle |
