@@ -22,8 +22,8 @@ PORT=${PORT:-18024}
 # of the group: TP caps every rank at the smallest card.
 GPUS=${GPUS:?set GPUS to the two CMP 170HX devices, e.g. GPUS=1,2 or their UUIDs}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
-MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
-MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-1024}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}   # 4 concurrent streams: 333 tok/s aggregate vs 127 for one
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-1024}   # 4096 returned HTTP 500 on a 7K-token prefill
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
 KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
 # Sizing KV by fraction leaves ~4.5 GiB per card unused, because the profiler
@@ -31,13 +31,14 @@ KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
 # the exact byte count that fills the card; this is it, per 64 GB card with MTP
 # on. Set KV_CACHE_MEMORY= (empty) to fall back to the fraction.
 KV_CACHE_MEMORY=${KV_CACHE_MEMORY:-24383208960}
-# mode 0 = no inductor. Inductor compilation of this architecture hangs on
-# Ampere; decode CUDA graphs alone are the difference between 9 and 105 tok/s.
-# FULL is not an option even with MTP: the QSA attention backend only supports
-# uniform batches, and vLLM downgrades FULL to FULL_DECODE_ONLY anyway.
+# mode 0 = no inductor. VLLM_COMPILE was measured too: it starts (it does not
+# hang, whatever older notes say) but decodes no faster and starts 30 s slower.
+# FULL is not an option: the QSA attention backend only supports uniform
+# batches, and vLLM downgrades FULL to FULL_DECODE_ONLY anyway.
 COMPILATION_CONFIG=${COMPILATION_CONFIG:-'{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}'}
 # The checkpoint keeps its MTP draft head in BF16, so speculative decoding is
-# available and worth +60% single-stream. SPEC= (empty) disables it.
+# available. k=4 measured best: code 173-182 tok/s vs 157 (k=3), 134 (k=2),
+# 66 (off); prose is ~100-110 for any k. SPEC= (empty) disables it.
 SPEC=${SPEC-'{"method":"mtp","num_speculative_tokens":4}'}
 DIST=/usr/local/lib/python3.12/dist-packages
 VLLM_PKG=$DIST/vllm

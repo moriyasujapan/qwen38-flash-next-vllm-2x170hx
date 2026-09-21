@@ -2,13 +2,14 @@
 
 [日本語](README_ja.md)
 
-Serving **Qwen3.8-Flash-Next** (W4A16) on two **NVIDIA CMP 170HX** mining cards with
-vLLM — GA100, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x16, no P2P — on a host with
-only **91 GB of RAM**.
+Serving **Qwen3.8-Flash-Next** (W4A16) on two **NVIDIA CMP 170HX** mining cards with vLLM,
+on a host with **92 GiB of RAM** — less than the published recipes ask for.
 
-**~170–190 tok/s single-stream decode (up to 277 on code) · 1,058,505 KV tokens ·
-65K context · tool calling** — about 3.5× the same model as a GGUF on llama.cpp on
-one of these cards (49 tok/s).
+**~100–115 tok/s on prose, ~175 tok/s on code, single stream · 333 tok/s aggregate at
+4 concurrent · 1,058,505 KV tokens · 65K context · tool calling.**
+
+Every number on this page was measured on this machine; how is in [Method](#method), and
+the raw results are in `results/`.
 
 ---
 
@@ -16,69 +17,118 @@ one of these cards (49 tok/s).
 
 The published Flash-Next W4A16 recipes
 ([loktar00](https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe),
-[alesha-pro](https://github.com/alesha-pro/qwen38-flash-next-4x3090)) target 4× RTX
-3090 and ask for 110–128 GB of host RAM. Two things make it fit on two 170HX and 91 GB:
+[alesha-pro](https://github.com/alesha-pro/qwen38-flash-next-4x3090)) target 4× RTX 3090
+and ask for 110–128 GB of host RAM. Two things make it fit on two 170HX and 92 GiB:
 
-1. **The PLE n-gram table is converted to FP8 locally.** The W4A16 checkpoints keep the
-   51B-parameter per-layer-embedding table in BF16 (~96 GiB), and vLLM's PLE offload
-   holds it in host RAM. `scripts/quantize_ple_fp8.py` rewrites it as FP8 E4M3 with one
-   global scale (`amax / 448`) — the layout alesha-pro's offload overlay reads — which
-   halves it to ~48 GiB. The scale it derives, `0.00019931793212890625`, is
-   **bit-identical** to the one in RadixArk's published FP8 PLE, so this is the same
-   table without a second 180 GB download.
-2. **TP2 + expert parallel on 64 GB cards.** Two 170HX hold the ~77 GiB of GPU-resident
-   weights with room for a million-token KV cache. Expert parallel is required: the MoE
+1. **The PLE n-gram table is converted to FP8 locally.** The W4A16 checkpoint keeps the
+   51B-parameter per-layer-embedding n-gram table in BF16 (102.4 GB / 95.4 GiB), and
+   vLLM's PLE offload holds it in host RAM. `scripts/quantize_ple_fp8.py` rewrites it as
+   FP8 E4M3 with one global scale (`amax / 448`) — the layout alesha-pro's offload overlay
+   reads — which brings it to 51.3 GB / 47.7 GiB. The derived scale,
+   `0.00019931793212890625`, is **bit-identical** to the one in RadixArk's published FP8
+   PLE: the same table, without a second 180 GB download.
+2. **TP2 + expert parallel on 64 GB cards.** Expert parallel is required: the MoE
    intermediate size 640 split two ways is 320, which the quant's group size of 128 does
    not divide.
 
-MTP speculative decoding (the checkpoint ships its draft head in BF16) is on by default
-and is worth about +60%.
+## Hardware, measured
+
+| | |
+|---|---|
+| GPUs | 2× CMP 170HX: GA100, sm_80, 70 SMs, 63.4 GiB usable each |
+| Interconnect | PCIe Gen2 x16 per card (`lspci` LnkSta 5 GT/s x16), **no P2P** (`can_device_access_peer` false both ways) |
+| Host ↔ device | **6.6 GB/s** (pinned, 256 MB copies), ~83% of the Gen2 x16 ceiling |
+| Host RAM | 91.9 GiB |
+
+Some 170HX write-ups describe the link as fused down to x4. These cards are not; check
+yours with `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current
+--format=csv` and a copy benchmark, since an x4 card moves a quarter of the data.
 
 ## Results
 
-Three prompts (Japanese prose, Python code, a longer list), streaming, `temperature
-0.7`, `reasoning_effort: medium`, one sample each. Expect ±15% run to run.
+Default configuration: MTP k=4, `--max-num-seqs 8`, `--max-num-batched-tokens 1024`,
+BF16 KV, `--kv-cache-memory` sized to fill the card.
 
-| config | prose | code | longer | median |
+### Decode, single stream (tok/s, median of 3, 512 max tokens)
+
+| config | ja prose | en prose | ja list | code |
 |---|---|---|---|---|
-| llama.cpp, GGUF Q4_K_M 4.27bpw, 1× 170HX | – | – | – | 49 |
-| vLLM W4A16, no MTP | 145.3 | 92.1 | 108.5 | 108.5 |
-| vLLM W4A16, MTP k=4 | 173.3 | 276.6 | 149.6 | 173.3 |
-| vLLM W4A16, MTP k=4, full KV (**default**) | 188.3 | 253.0 | 143.0 | **188.3** |
+| no MTP | 65.8 | 65.9 | 64.9 | 66.5 |
+| MTP k=2 | 105.3 | 102.2 | 101.2 | 133.6 |
+| MTP k=3 | 105.9 | 104.6 | 111.1 | 156.5 |
+| MTP k=4, `max-num-seqs 1` | 99.6 | 100.9 | 104.9 | 182.0 |
+| **MTP k=4, `max-num-seqs 8` (default)** | **104.5** | **101.1** | **114.0** | **173.0** |
 
-Long-form: the 5-section Japanese report prompt in `bench/report-prompt-ja.txt`
-produced 6,813 characters / 4,080 tokens in 44 s (102 tok/s, TTFT 4.1 s), finished
-cleanly, all sections present, no garbled Japanese.
+MTP is worth ~1.6× on prose and ~2.6× on code. Larger k helps code (predictable tokens)
+and makes no difference to prose. The min–max spread within a cell is typically ±5–10%.
 
-Raising `--max-num-batched-tokens` from 1024 to 2048 (vLLM warns about it with MTP)
-measured 164 vs 173 — noise, so it stays at 1024.
+### Concurrency (aggregate tok/s, 256-token code answers)
+
+| concurrent requests | 1 | 4 | 8 |
+|---|---|---|---|
+| `max-num-seqs 1` | 127 | 126 (queued) | – |
+| **`max-num-seqs 8`** | 127 | **333** | 302 |
+
+### Prefill (prompt tok/s, prefix cache defeated with a random nonce)
+
+| prompt | 6,954 tokens | 27,853 tokens |
+|---|---|---|
+| default | 2,637 | 3,068 |
+
+### Things that did not help
+
+| tried | result |
+|---|---|
+| `--max-num-batched-tokens 4096` | HTTP 500 on a 7K-token prefill; decode unchanged |
+| `VLLM_COMPILE` (inductor) | starts fine — it does **not** hang, despite older notes — but decodes no faster (124 / 101 / 112 / 176) and starts 30 s slower |
+| `--pipeline-parallel-size 2` | refused at startup: `VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
+| `cudagraph_mode: FULL` | downgraded by vLLM to `FULL_DECODE_ONLY` (the QSA backend supports uniform batches only) |
+
+### Long-form output
+
+The 5-section Japanese report prompt in `bench/report-prompt-ja.txt` produced 6,813
+characters / 4,080 tokens in 44 s with `reasoning_effort: medium`, finished cleanly, every
+section present, no garbled Japanese. It also confidently expanded an acronym it did not
+know and filled a comparison table with unsourced numbers — verify specifics.
 
 ### Where the memory goes
 
 | | per card | total |
 |---|---|---|
-| weights + non-torch | 38.7 GiB | 77.4 GiB |
+| weights + non-torch (incl. MTP head) | 38.7 GiB | 77.4 GiB |
 | KV cache (BF16) | 22.7 GiB | 45.4 GiB → 1,058,505 tokens |
-| host RAM, PLE offload worker | – | 49.2 GiB RSS |
+| host RAM, whole container | – | 61.2 GiB (PLE worker 48.4 GiB) |
 
-Startup is about 5 minutes: weights ~100 s, FP8 PLE ~15 s, engine init and CUDA graph
-capture ~120 s.
+Startup takes about **5 min 50 s**: main weights 103 s, MTP drafter 9 s, FP8 PLE ~40 s,
+engine init and CUDA graph capture 122 s.
 
-The link on these cards negotiates Gen2 x16 and measures **6.6 GB/s** host↔device
-(pinned, 256 MB copies), about 83% of the Gen2 x16 ceiling. Some 170HX write-ups
-describe the link as fused down to x4; check yours with
-`nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv`
-and a copy benchmark, since an x4 card would move a quarter of that.
+## Use `reasoning_effort: medium` (or low). Never leave it at the default.
+
+The chat template defaults to `xhigh`. Measured on three coding/reasoning prompts, two runs
+per level, max_tokens 20,000 (reasoning tokens per run):
+
+| prompt | low | medium | xhigh |
+|---|---|---|---|
+| CSV statistics function | 176 / 205 | 196 / 117 | 1,114 / **20,000, truncated** |
+| asyncio server slowdown | 238 / 307 | 440 / 335 | **16,577 / 19,451, both truncated** |
+| algorithm with proof | 557 / 693 | 1,302 / 451 | **19,403 / 20,000, both truncated** |
+
+low and medium finished every answer. **xhigh spent the whole budget thinking and never
+answered in 5 of 6 runs** — about three minutes of nothing each. Send
+`chat_template_kwargs: {"reasoning_effort": "medium"}` (valid values: `xhigh`, `medium`,
+`low`; `high` is rejected). Clients that do not send it get `xhigh`.
 
 ## Requirements
 
-- **Two 64 GB sm_80 cards.** Tested on CMP 170HX; an A100 80GB pair should work too.
-- **~64 GB of free host RAM** for the FP8 PLE worker (49 GiB) plus headroom.
-- **~270 GB of disk** (180 GB checkpoint + 51 GB derived PLE + 29 GB image).
-- Docker with the NVIDIA runtime, driver new enough for CUDA 13.0.
-- If your 170HX throughput is far below these numbers, check for the motherboard
-  `PWRBRK#` power brake first — see
+- **Two 64 GB sm_80 cards.** Only CMP 170HX has been tested.
+- **~64 GiB of free host RAM** for the container (61.2 GiB measured). On this 92 GiB host
+  that leaves ~31 GiB.
+- **~260 GB of disk**: 179.8 GB checkpoint + 51.3 GB derived PLE + 28.8 GB image.
+- Docker with the NVIDIA runtime and a driver new enough for the CUDA 13.0 image.
+- If a 170HX runs far below these numbers, check the motherboard `PWRBRK#` power brake
+  first — see
   [deepseek-v4-cmp170hx](https://github.com/allover326/deepseek-v4-cmp170hx#troubleshooting-cards-running-4-slow-pwrbrk--edge-pin-b30).
+  (Here `HW Power Brake Slowdown` reads `Not Active` on both cards.)
 
 ## Quick start
 
@@ -86,47 +136,44 @@ and a copy benchmark, since an x4 card would move a quarter of that.
 git clone https://github.com/moriyasujapan/qwen38-flash-next-vllm-2x170hx
 cd qwen38-flash-next-vllm-2x170hx
 
-./scripts/setup.sh            # pinned overlays + vLLM image (~29 GB)
-./scripts/download-model.sh   # ~180 GB, rate-limited (RATE=95M), resumable
-./scripts/build-ple-fp8.sh    # BF16 PLE -> FP8 + manifest, a few minutes
+./scripts/setup.sh            # pinned overlays + vLLM image (28.8 GB)
+./scripts/download-model.sh   # 179.8 GB, rate-limited (RATE=95M), resumable
+./scripts/build-ple-fp8.sh    # BF16 PLE -> FP8 + manifest
 
 GPUS=1,2 ./scripts/run.sh     # the two 170HX, by index or UUID (nvidia-smi -L)
 until curl -sf localhost:18024/health; do sleep 10; done
-python3 bench/bench.py
+python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
 ```
 
 The endpoint is `http://localhost:18024/v1`, model `flash-next-w4a16`, with the
-`qwen3_xml` tool-call parser and `qwen3` reasoning parser enabled.
-`gateway/litellm-config.yaml` is an optional LiteLLM front end.
-
-Every path and setting is an environment variable; see `scripts/env.sh` and the top of
-`scripts/run.sh`.
+`qwen3_xml` tool-call parser and `qwen3` reasoning parser. `gateway/litellm-config.yaml` is
+an optional LiteLLM front end. Every path and setting is an environment variable; see
+`scripts/env.sh` and the top of `scripts/run.sh`.
 
 ## Settings worth knowing
 
 | setting | value | why |
 |---|---|---|
 | `--tensor-parallel-size 2 --enable-expert-parallel` | required | 640/2 is not divisible by the group size 128 |
-| `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductor hangs on Ampere for this model; FULL is refused by the QSA backend |
-| `--speculative-config` | `{"method":"mtp","num_speculative_tokens":4}` | +60%; `SPEC=` disables |
-| `--kv-cache-memory` | 24383208960 | fills a 64 GB card; the fraction-based default leaves ~4.5 GiB idle |
-| `--kv-cache-dtype` | `auto` (BF16) | FP8 KV needs a calibration made for this composition |
+| `--speculative-config` | MTP, k=4 | fastest on code, equal on prose (table above) |
+| `--max-num-seqs` | 8 | 2.6× aggregate at 4 concurrent; single stream unchanged |
+| `--max-num-batched-tokens` | 1024 | 4096 returned HTTP 500 on a 7K prefill |
+| `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductor gains nothing here; FULL is downgraded |
+| `--kv-cache-memory` | 24383208960 | fills a 64 GB card; the fraction-based default left 4.35 GiB per card idle |
+| `--kv-cache-dtype` | `auto` (BF16) | FP8 KV needs a calibration for this composition; not done yet |
 | `VLLM_PLE_EMBEDDING_DTYPE` | `float8_e4m3fn` | selects the FP8 PLE path in the overlay |
-| `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | required | the PLE offload worker uses `pidfd_getfd` |
+| `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | kept from the upstream recipe | the PLE offload worker uses `pidfd_getfd`; not re-tested without it |
 
-## Known limits
+## Method
 
-- **Send `chat_template_kwargs: {"reasoning_effort": "medium"}` for long outputs.** The
-  template defaults to `xhigh`, which can spend tens of thousands of reasoning tokens and
-  truncate.
-- **Pipeline parallel is not an option.** The PLE offload refuses PP, so on PCIe-only
-  cards this is TP with PyNCCL all-reduce (custom all-reduce is disabled without P2P).
-- **FP8 KV is untested here.** alesha-pro's calibrated FP8 QSA scales belong to their
-  checkpoint; using them on this one is unvalidated.
-- **Quality, in one long-form test:** fluent, well-structured Japanese that followed
-  every formatting constraint, but it confidently expanded an acronym it did not know
-  and filled a comparison table with unsourced numbers. Verify specifics.
-- The two cards are fully used; nothing else fits on them alongside this.
+- `bench/bench.py`: streaming requests, `temperature 0.7`, `reasoning_effort: medium`.
+  Decode tok/s = (completion tokens − 1) / (last token − first token), so TTFT is
+  excluded; completion tokens include reasoning. Prefill tok/s = prompt tokens / TTFT, with
+  a random nonce at the start of every prompt so the prefix cache cannot serve it.
+- Each configuration ran in a fresh container with nothing else sent to the server, except
+  the run labelled `E` in `results/`, whose decode numbers overlapped with other requests
+  and are not used above; the default row is its clean re-run, `FINAL`.
+- The `batched-tokens 4096` run failed before it could write its result line.
 
 ## Credits
 
@@ -135,7 +182,7 @@ Every path and setting is an environment variable; see `scripts/env.sh` and the 
 - [alesha-pro/qwen38-flash-next-4x3090](https://github.com/alesha-pro/qwen38-flash-next-4x3090)
   for the PLE offload overlays and manifest tooling this mounts (pinned, not vendored).
 - [loktar00/qwen38-flash-next-vllm-3090-recipe](https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe)
-  for the measured settings and MTP findings.
+  for the starting settings and MTP findings.
 - [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
   for the FP8 PLE layout this reproduces.
 - vLLM.
