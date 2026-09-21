@@ -3,7 +3,7 @@
 [日本語](README_ja.md)
 
 Serving **Qwen3.8-Flash-Next** (W4A16) on two **NVIDIA CMP 170HX** mining cards with
-vLLM — GA100, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x4, no P2P — on a host with
+vLLM — GA100, sm_80, VRAM-unlocked to 64 GB, PCIe Gen2 x16, no P2P — on a host with
 only **91 GB of RAM**.
 
 **~170–190 tok/s single-stream decode (up to 277 on code) · 1,058,505 KV tokens ·
@@ -63,6 +63,12 @@ measured 164 vs 173 — noise, so it stays at 1024.
 
 Startup is about 5 minutes: weights ~100 s, FP8 PLE ~15 s, engine init and CUDA graph
 capture ~120 s.
+
+The link on these cards negotiates Gen2 x16 and measures **6.6 GB/s** host↔device
+(pinned, 256 MB copies), about 83% of the Gen2 x16 ceiling. Some 170HX write-ups
+describe the link as fused down to x4; check yours with
+`nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current --format=csv`
+and a copy benchmark, since an x4 card would move a quarter of that.
 
 ## Requirements
 
