@@ -83,6 +83,26 @@ and makes no difference to prose. The min–max spread within a cell is typicall
 | `VLLM_COMPILE` (inductor) | starts fine — it does **not** hang, despite older notes — but decodes no faster (124 / 101 / 112 / 176) and starts 30 s slower |
 | `--pipeline-parallel-size 2` | refused at startup: `VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
 | `cudagraph_mode: FULL` | downgraded by vLLM to `FULL_DECODE_ONLY` (the QSA backend supports uniform batches only) |
+| FP8 KV (`fp8_e4m3`, alesha-pro's QSA overlays, scales calibrated for this composition) | works, but not worth it here — see below |
+
+### FP8 KV cache
+
+Calibrated with the overlay's own collector (`QSA_FP8_CALIBRATE_OUT`) on this checkpoint,
+TP2 and MTP k=4, taking per layer the larger of this calibration and alesha-pro's; the
+result is in `results/fp8-kv-scales-w4a16-tp2-mtp4.json`. The MTP drafter's attention
+layer has no entry in alesha-pro's file, so calibrating here was necessary.
+
+| | BF16 KV (default) | FP8 KV |
+|---|---|---|
+| KV tokens | 1,058,505 | 1,441,792 (+36%; the linear-attention state stays BF16) |
+| decode ja / en / list / code | 104.5 / 101.1 / 114.0 / 173.0 | 95.5 / 94.9 / 101.2 / 158.0 (−6 to −11%) |
+| prefill 7K / 28K | 2,637 / 3,068 | 2,668 / 2,603 |
+| needle, 29K-43K tokens, chat format, 12 runs | 11 found, 1 refused | 10 found, 2 refused |
+| 16 short greedy prompts, 64 tokens | – | 12 identical to BF16; 4 reworded, none broken |
+
+Retrieval matched BF16 (no run failed to find the needle; the misses were the model
+declining to reveal a "vault override code"). But decode is slower and the extra capacity
+is not needed: BF16 already holds eight concurrent 65K contexts twice over. Default stays BF16.
 
 ### Long-form output
 
@@ -160,7 +180,7 @@ an optional LiteLLM front end. Every path and setting is an environment variable
 | `--max-num-batched-tokens` | 1024 | 4096 returned HTTP 500 on a 7K prefill |
 | `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductor gains nothing here; FULL is downgraded |
 | `--kv-cache-memory` | 24383208960 | fills a 64 GB card; the fraction-based default left 4.35 GiB per card idle |
-| `--kv-cache-dtype` | `auto` (BF16) | FP8 KV needs a calibration for this composition; not done yet |
+| `--kv-cache-dtype` | `auto` (BF16) | FP8 KV measured: +36% capacity, 6-11% slower decode |
 | `VLLM_PLE_EMBEDDING_DTYPE` | `float8_e4m3fn` | selects the FP8 PLE path in the overlay |
 | `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | kept from the upstream recipe | the PLE offload worker uses `pidfd_getfd`; not re-tested without it |
 
@@ -174,6 +194,9 @@ an optional LiteLLM front end. Every path and setting is an environment variable
   the run labelled `E` in `results/`, whose decode numbers overlapped with other requests
   and are not used above; the default row is its clean re-run, `FINAL`.
 - The `batched-tokens 4096` run failed before it could write its result line.
+- Needle tests go through the chat template. Sent as raw `/v1/completions` text, the same
+  documents made the model stop after one token on BF16 and FP8 alike, depending only on
+  how the document began; an early FP8 "failure" turned out to be this, not the cache.
 
 ## Credits
 

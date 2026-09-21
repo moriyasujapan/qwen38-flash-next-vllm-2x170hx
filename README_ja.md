@@ -81,6 +81,26 @@ MTPの効果は、散文で約1.6倍、コードで約2.6倍です。kを増や�
 | `VLLM_COMPILE`（inductor） | 問題なく起動する（古い資料にある「止まる」は起きない）。ただしデコードは速くならず（124 / 101 / 112 / 176）、起動が30秒遅くなる |
 | `--pipeline-parallel-size 2` | 起動時に拒否：`VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
 | `cudagraph_mode: FULL` | vLLMが `FULL_DECODE_ONLY` に格下げする（QSAバックエンドが均一バッチにしか対応していない） |
+| FP8 KV（`fp8_e4m3`、alesha-proのQSAオーバーレイ、この構成用にキャリブレーション） | 動くが、ここでは使う価値がない（下記） |
+
+### FP8 KVキャッシュ
+
+オーバーレイ付属の収集機能（`QSA_FP8_CALIBRATE_OUT`）で、このチェックポイント・TP2・MTP k=4
+の構成でキャリブレーションし、層ごとに自前とalesha-proの値の大きい方を採用しました
+（`results/fp8-kv-scales-w4a16-tp2-mtp4.json`）。MTPドラフターのアテンション層はalesha-proの
+ファイルに含まれていないので、自前のキャリブレーションが必要でした。
+
+| | BF16 KV（既定） | FP8 KV |
+|---|---|---|
+| KVトークン数 | 1,058,505 | 1,441,792（+36%。線形アテンションの状態はBF16のまま） |
+| デコード 日本語 / 英語 / リスト / コード | 104.5 / 101.1 / 114.0 / 173.0 | 95.5 / 94.9 / 101.2 / 158.0（−6〜−11%） |
+| プリフィル 7K / 28K | 2,637 / 3,068 | 2,668 / 2,603 |
+| ニードル、2.9万〜4.3万トークン、チャット形式、12回 | 正解11、拒否1 | 正解10、拒否2 |
+| 短い貪欲生成16件、64トークン | – | 12件がBF16と同一、4件は言い回しの違いのみで破綻なし |
+
+検索能力はBF16と同等でした（見つけられなかった回はなく、失敗はすべて「金庫の解除コード」の
+開示をモデルが拒否したもの）。ただしデコードが遅くなり、増える容量も不要です。BF16でも
+65Kのコンテキスト8本分の2倍を保持できます。既定はBF16のままです。
 
 ### 長文の出力
 
@@ -157,7 +177,7 @@ python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
 | `--max-num-batched-tokens` | 1024 | 4096は7Kのプリフィルで500エラー |
 | `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductorは効果なし、FULLは格下げされる |
 | `--kv-cache-memory` | 24383208960 | 64GBカードを使い切る値。割合指定では1枚あたり4.35GiB余っていた |
-| `--kv-cache-dtype` | `auto`（BF16） | FP8 KVにはこの構成用のキャリブレーションが必要。未実施 |
+| `--kv-cache-dtype` | `auto`（BF16） | FP8 KVを実測：容量+36%、デコード6〜11%低下 |
 | `VLLM_PLE_EMBEDDING_DTYPE` | `float8_e4m3fn` | オーバーレイのFP8 PLE経路を選ぶ |
 | `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | 元レシピのまま | PLEオフロードが `pidfd_getfd` を使う。外した場合は未検証 |
 
@@ -172,6 +192,9 @@ python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
   `E` で、デコードの計測中に別のリクエストが重なったため上の表には使っていません。既定の
   行はそのやり直し（`FINAL`）です。
 - `batched-tokens 4096` は、結果を書き出す前にエラーで止まりました。
+- ニードルテストはチャットテンプレート経由で行っています。同じ文書を生の `/v1/completions`
+  で送ると、文書の書き出し方次第でBF16でもFP8でも1トークンで止まりました。FP8の「失敗」に
+  見えた初期の結果は、キャッシュではなくこれが原因でした。
 
 ## クレジット
 
