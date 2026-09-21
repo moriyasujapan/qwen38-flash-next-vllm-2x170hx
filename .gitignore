@@ -1,0 +1,5 @@
+models/
+vendor/
+*.log
+report.md
+__pycache__/

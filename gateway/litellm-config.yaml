@@ -1,0 +1,28 @@
+# Optional: an OpenAI-compatible LiteLLM gateway in front of the vLLM server,
+# so clients select the model by name instead of by port.
+#
+#   docker run -d --name llm-gateway --network host \
+#     -e LITELLM_MASTER_KEY=<your key> \
+#     -v "$PWD/gateway/litellm-config.yaml:/app/config.yaml:ro" \
+#     ghcr.io/berriai/litellm:main-latest --config /app/config.yaml --port 18020
+#
+# No secrets in this file; the master key comes from the environment.
+
+model_list:
+  - model_name: flash-next
+    litellm_params:
+      model: openai/flash-next-w4a16
+      api_base: http://127.0.0.1:18024/v1
+      api_key: "none"
+
+litellm_settings:
+  # vLLM and LiteLLM do not implement exactly the same parameters; drop the
+  # ones vLLM does not understand rather than failing the request.
+  drop_params: true
+  # Local GPUs, not a paid API: long prefills are normal, and a retry would
+  # just queue a second one behind the first.
+  request_timeout: 1800
+  num_retries: 0
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
