@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Derive the FP8 external PLE checkpoint from the W4A16 checkpoint's BF16 PLE
+# Derive the FP8 external PLE checkpoint from the base W4A16 checkpoint's BF16 PLE
 # tensors, then write the manifest the offload overlay validates against.
 #
 # Runs inside the vLLM image because the conversion needs torch (FP8 dtypes) and
@@ -11,7 +11,7 @@ mkdir -p "$PLE_MODEL_DIR"
 docker run --rm \
     --user "$(id -u):$(id -g)" \
     -v "$REPO/scripts:/scripts:ro" \
-    -v "$MODEL_DIR:/src:ro" \
+    -v "$BASE_MODEL_DIR:/src:ro" \
     -v "$PLE_MODEL_DIR:/out" \
     --entrypoint python3 \
     "$IMAGE" /scripts/quantize_ple_fp8.py /src /out

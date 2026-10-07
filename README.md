@@ -7,10 +7,16 @@ on a host with **92 GiB of RAM** — less than the published recipes ask for.
 
 **~100–110 tok/s on prose, ~170 tok/s on code, single stream · ~390 tok/s aggregate at
 4 concurrent · 262,144-token context (the model's native maximum; a 200K-token needle is
-found) · 1,486,412 KV tokens · tool calling.**
+found) · tool calling.**
 
 Every number on this page was measured on this machine; how is in [Method](#method), and
 the raw results are in `results/`.
+
+> **The default model is now heretic-2** (refusals removed), not the Vnimanie W4A16
+> checkpoint the tables under [Results](#results) were measured on, and the defaults moved
+> to `--max-num-batched-tokens 8192` with a 17.6 GiB-per-card KV cache. See
+> [Model: heretic-2](#model-heretic-2) and [Batched tokens and KV size](#batched-tokens-and-kv-size).
+> `MODEL_DIR=$BASE_MODEL_DIR` still serves the Vnimanie checkpoint.
 
 ---
 
@@ -32,6 +38,42 @@ and ask for 110–128 GB of host RAM. Two things make it fit on two 170HX and 92
    intermediate size 640 split two ways is 320, which the quant's group size of 128 does
    not divide.
 
+## Model: heretic-2
+
+`run.sh` serves [densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE](https://huggingface.co/densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE)
+(revision `705a2ce`), an AutoRound W4A16 quant of
+[trohrbaugh/Qwen3.8-Flash-Next-heretic-2](https://huggingface.co/trohrbaugh/Qwen3.8-Flash-Next-heretic-2),
+a version of the model with its refusals removed. It is the same architecture, so it runs
+on the same image and overlays, after `scripts/prepare-heretic2.sh` rewrites it:
+
+- **Quantization config.** The image has no `auto-round` method, but its AutoGPTQ path reads
+  the same packing. `config.json` becomes the base checkpoint's with a GPTQ w4 g128 sym
+  block; only routed experts are quantized (73,728 `qweight` tensors, all under `.experts.`),
+  and `dynamic: {"-:.*mtp.*": {}}` keeps the MTP head BF16. The routed experts run on
+  Marlin (`Using MarlinExperts` in the log), whatever `--quantization` says: the image maps
+  `gptq`, `gptq_marlin` and `marlin` all to `auto_gptq`.
+- **MTP head.** The checkpoint ships none, so the base checkpoint's BF16 MTP head is copied in
+  as `model-mtp-graft.safetensors` (4.9 GiB). It was trained against the unmodified model;
+  verification keeps the target's tokens either way.
+- **Tokenizer, chat template, generation config.** Taken from the base checkpoint (the
+  tokenizer files are byte-identical to it after the rewrite); the heretic
+  `generation_config.json` stops on token 248044 only, the base one on 248046 and 248044.
+- **PLE.** The FP8 table derived from the base checkpoint (`build-ple-fp8.sh`) is used; the
+  repo's own FP8 PLE shards are not downloaded.
+
+Measured on heretic-2 with the previous defaults (batched tokens 1024, 22.7 GiB KV per card),
+in a [depth-ladder report on bench-of-us](https://github.com/jimoto-no-llm/bench-of-us/blob/main/report/2026-09-27_153558_measuring_qwen3.8_flash_next_w4a16_on_2x_cmp_170hx_with_vllm_tp2.md):
+
+| depth | prefill (new tokens/s) | decode, synthetic text | decode, real-style generation |
+|---|---|---|---|
+| 32K | 3,323 | 186.2 (MTP acceptance 0.94) | 97.1 (0.39) |
+| 128K | 2,994 | 184.6 (0.95) | 89.1 (0.35) |
+| 258K | 2,575 | 178.3 (0.93) | 69.7 (0.21) |
+
+The 2.6× gap between the two decode columns is MTP acceptance alone: a synthetic ladder
+overstates decode for an MTP model. The heretic-2 figures are not directly comparable with
+the [Results](#results) tables below, which use `bench/bench.py` on the base checkpoint.
+
 ## Hardware, measured
 
 | | |
@@ -47,9 +89,11 @@ yours with `nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.width.current
 
 ## Results
 
-Default configuration: `--max-model-len 262144`, MTP k=4, `--max-num-seqs 8`,
-`--max-num-batched-tokens 1024`, BF16 KV, `--kv-cache-memory` sized to fill the card.
-Rows marked 64K were measured with `--max-model-len 65536`, before the default moved.
+Measured on the **base Vnimanie checkpoint** with the configuration that was the default at
+the time: `--max-model-len 262144`, MTP k=4, `--max-num-seqs 8`,
+`--max-num-batched-tokens 1024`, BF16 KV, `--kv-cache-memory 24383208960` (fills the card).
+Rows marked 64K were measured with `--max-model-len 65536`, before that default moved. The
+current defaults are in [Batched tokens and KV size](#batched-tokens-and-kv-size).
 
 ### Decode, single stream (tok/s, median of 3, 512 max tokens)
 
@@ -91,11 +135,27 @@ first pass over a long document pays the prefill.
 
 | tried | result |
 |---|---|
-| `--max-num-batched-tokens 4096` | HTTP 500 on a 7K-token prefill; decode unchanged |
+| `--max-num-batched-tokens 4096` with the full-card KV (24383208960) | HTTP 500 on a 7K-token prefill; decode unchanged. With a smaller KV, 8192 works — see below |
 | `VLLM_COMPILE` (inductor) | starts fine — it does **not** hang, despite older notes — but decodes no faster (124 / 101 / 112 / 176) and starts 30 s slower |
 | `--pipeline-parallel-size 2` | refused at startup: `VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
 | `cudagraph_mode: FULL` | downgraded by vLLM to `FULL_DECODE_ONLY` (the QSA backend supports uniform batches only) |
 | FP8 KV (`fp8_e4m3`, alesha-pro's QSA overlays, scales calibrated for this composition) | works, but not worth it here — see below |
+
+### Batched tokens and KV size
+
+`--max-num-batched-tokens 8192` (8× the old 1024) needs room for prefill activations that
+the full-card KV left no space for, and an explicit `--kv-cache-memory` skips the profiling
+that would otherwise reserve it. Measured with 8192, heretic-2, per card:
+
+| `--kv-cache-memory` | result |
+|---|---|
+| 21213949952 (19.76 GiB), vLLM's own "to fully utilize gpu memory" suggestion | runtime OOM on an 8.9K-token prefill |
+| **18897856102 (17.6 GiB), default** | 1,151,760 KV tokens, 4.39× concurrency at 262K. 8 parallel 33K-token requests pass; peak 64,783 / 65,536 MiB, **753 MiB to spare** |
+| empty (sized by `--gpu-memory-utilization 0.92`, 15.5 GiB) | 1,016,505 KV tokens; the safe side |
+
+The margin at 17.6 GiB is thin. If it OOMs, `KV_CACHE_MEMORY= ./scripts/run.sh` falls back
+to the fraction, and `MAX_NUM_BATCHED_TOKENS=1024 KV_CACHE_MEMORY=24383208960` restores the
+configuration the Results tables were measured with.
 
 ### FP8 KV cache
 
@@ -129,7 +189,8 @@ know and filled a comparison table with unsourced numbers — verify specifics.
 | | per card | total |
 |---|---|---|
 | weights + non-torch (incl. MTP head) | 38.7 GiB | 77.4 GiB |
-| KV cache (BF16) | 22.7 GiB | 45.4 GiB → 1,486,412 tokens at 262K context |
+| KV cache (BF16), as measured | 22.7 GiB | 45.4 GiB → 1,486,412 tokens at 262K context |
+| KV cache (BF16), current default | 17.6 GiB | 35.2 GiB → 1,151,760 tokens |
 | host RAM, whole container | – | 61.2 GiB (PLE worker 48.4 GiB) |
 
 Startup takes about **5 min 50 s**: main weights 103 s, MTP drafter 9 s, FP8 PLE ~40 s,
@@ -156,7 +217,9 @@ answered in 5 of 6 runs** — about three minutes of nothing each. Send
 - **Two 64 GB sm_80 cards.** Only CMP 170HX has been tested.
 - **~64 GiB of free host RAM** for the container (61.2 GiB measured). On this 92 GiB host
   that leaves ~31 GiB.
-- **~260 GB of disk**: 179.8 GB checkpoint + 51.3 GB derived PLE + 28.8 GB image.
+- **~335 GB of disk while preparing**: 179.8 GB base checkpoint + 74 GB heretic-2 +
+  51.3 GB derived PLE + 28.8 GB image. The base checkpoint can be deleted once
+  `prepare-heretic2.sh` and `build-ple-fp8.sh` have run (~155 GB left).
 - Docker with the NVIDIA runtime and a driver new enough for the CUDA 13.0 image.
 - If a 170HX runs far below these numbers, check the motherboard `PWRBRK#` power brake
   first — see
@@ -169,9 +232,11 @@ answered in 5 of 6 runs** — about three minutes of nothing each. Send
 git clone https://github.com/moriyasujapan/qwen38-flash-next-vllm-2x170hx
 cd qwen38-flash-next-vllm-2x170hx
 
-./scripts/setup.sh            # pinned overlays + vLLM image (28.8 GB)
-./scripts/download-model.sh   # 179.8 GB, rate-limited (RATE=95M), resumable
-./scripts/build-ple-fp8.sh    # BF16 PLE -> FP8 + manifest
+./scripts/setup.sh              # pinned overlays + vLLM image (28.8 GB)
+./scripts/download-model.sh     # base W4A16, 179.8 GB, rate-limited (RATE=95M), resumable
+./scripts/build-ple-fp8.sh      # BF16 PLE -> FP8 + manifest
+./scripts/download-heretic2.sh  # heretic-2 W4A16, 74 GB, sha256-verified, resumable
+./scripts/prepare-heretic2.sh   # GPTQ config, base tokenizer, MTP head graft
 
 GPUS=1,2 ./scripts/run.sh     # the two 170HX, by index or UUID (nvidia-smi -L)
 until curl -sf localhost:18024/health; do sleep 10; done
@@ -191,11 +256,12 @@ an optional LiteLLM front end. Every path and setting is an environment variable
 | `--speculative-config` | MTP, k=4 | fastest on code, equal on prose (table above) |
 | `--max-model-len` | 262144 | the model's native maximum; raising it did not slow short requests |
 | `--max-num-seqs` | 8 | ~3× aggregate at 4 concurrent; single stream unchanged |
-| `--max-num-batched-tokens` | 1024 | 4096 returned HTTP 500 on a 7K prefill |
+| `--max-num-batched-tokens` | 8192 | works with the KV size below; 4096 returned HTTP 500 with the full-card KV |
 | `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductor gains nothing here; FULL is downgraded |
-| `--kv-cache-memory` | 24383208960 | fills a 64 GB card; the fraction-based default left 4.35 GiB per card idle |
+| `--kv-cache-memory` | 18897856102 | largest measured size that survives 8192-token prefill batches; vLLM's own suggestion OOMs |
 | `--kv-cache-dtype` | `auto` (BF16) | FP8 KV measured: +36% capacity, 6-11% slower decode |
 | `VLLM_PLE_EMBEDDING_DTYPE` | `float8_e4m3fn` | selects the FP8 PLE path in the overlay |
+| `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` | 75 | the 5 s default closed idle connections a LiteLLM gateway was about to reuse ("Server disconnected") |
 | `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | kept from the upstream recipe | the PLE offload worker uses `pidfd_getfd`; not re-tested without it |
 
 ## Method
@@ -216,6 +282,9 @@ an optional LiteLLM front end. Every path and setting is an environment variable
 
 - Qwen for the model; [VnimanieAI](https://huggingface.co/VnimanieAI/Qwen3.8-Flash-Next-W4A16)
   for the W4A16 quantization.
+- [trohrbaugh](https://huggingface.co/trohrbaugh/Qwen3.8-Flash-Next-heretic-2) for heretic-2;
+  [densohax](https://huggingface.co/densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE) for its
+  W4A16 quantization.
 - [alesha-pro/qwen38-flash-next-4x3090](https://github.com/alesha-pro/qwen38-flash-next-4x3090)
   for the PLE offload overlays and manifest tooling this mounts (pinned, not vendored).
 - [loktar00/qwen38-flash-next-vllm-3090-recipe](https://github.com/loktar00/qwen38-flash-next-vllm-3090-recipe)

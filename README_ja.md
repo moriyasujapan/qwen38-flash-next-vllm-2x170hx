@@ -7,10 +7,16 @@
 
 **1本あたり散文で約100〜110 tok/s、コードで約170 tok/s・同時4リクエストで合計約390 tok/s・
 コンテキスト262,144トークン（モデル本来の上限。20万トークンのニードルも正解）・
-KV 1,486,412トークン・ツール呼び出し対応。**
+ツール呼び出し対応。**
 
 このページの数値はすべてこのマシンで実測したものです。測り方は[計測方法](#計測方法)に、
 生データは `results/` にあります。
+
+> **既定のモデルは heretic-2（拒否応答を取り除いた版）に変わりました。**[結果](#結果)の表を
+> 測った Vnimanie の W4A16 ではありません。既定値も `--max-num-batched-tokens 8192`、KV は
+> 1枚あたり17.6GiBに変わっています。[モデル：heretic-2](#モデルheretic-2) と
+> [バッチトークン数とKVサイズ](#バッチトークン数とkvサイズ) を参照してください。
+> `MODEL_DIR=$BASE_MODEL_DIR` を指定すれば、今も Vnimanie のチェックポイントで動かせます。
 
 ---
 
@@ -30,6 +36,44 @@ KV 1,486,412トークン・ツール呼び出し対応。**
 2. **64GBカードでTP2＋エキスパート並列。** エキスパート並列は必須です。MoEの中間次元640を
    2分割すると320になり、量子化のグループサイズ128で割り切れません。
 
+## モデル：heretic-2
+
+`run.sh` が動かすのは
+[densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE](https://huggingface.co/densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE)
+（revision `705a2ce`）です。拒否応答を取り除いた
+[trohrbaugh/Qwen3.8-Flash-Next-heretic-2](https://huggingface.co/trohrbaugh/Qwen3.8-Flash-Next-heretic-2)
+を AutoRound で W4A16 に量子化したものです。アーキテクチャは同じなので、
+`scripts/prepare-heretic2.sh` で次の書き換えをすれば、同じイメージとオーバーレイで動きます。
+
+- **量子化設定。** イメージには `auto-round` 方式がありませんが、AutoGPTQ の経路で同じ
+  パッキングを読めます。`config.json` をベースのチェックポイントのものに置き換え、GPTQ
+  w4 g128 sym の設定を入れます。量子化されているのはルーティングされるエキスパートだけで
+  （`qweight` 73,728個がすべて `.experts.` 配下）、`dynamic: {"-:.*mtp.*": {}}` で MTP ヘッドは
+  BF16 のままにします。エキスパートの計算は Marlin です（ログに `Using MarlinExperts`）。
+  このイメージは `gptq`・`gptq_marlin`・`marlin` をすべて `auto_gptq` に置き換えるので、
+  `--quantization` の指定は関係ありません。
+- **MTPヘッド。** チェックポイントに含まれていないので、ベースの BF16 MTP ヘッドを
+  `model-mtp-graft.safetensors`（4.9GiB）として移植します。改変前のモデルに対して学習された
+  ヘッドですが、検証で採用されるのは本体のトークンです。
+- **トークナイザー・チャットテンプレート・生成設定。** ベースのチェックポイントのものを使います
+  （書き換え後のトークナイザー一式はベースとバイト単位で一致）。heretic の
+  `generation_config.json` は停止トークンが 248044 だけで、ベースは 248046 と 248044 です。
+- **PLE。** ベースから作った FP8 テーブル（`build-ple-fp8.sh`）を使います。リポジトリ付属の
+  FP8 PLE はダウンロードしません。
+
+heretic-2 を以前の既定値（バッチトークン数1024、KV 1枚あたり22.7GiB）で測った結果は、
+[bench-of-us の深度ラダーのレポート](https://github.com/jimoto-no-llm/bench-of-us/blob/main/report/2026-09-27_153558_measuring_qwen3.8_flash_next_w4a16_on_2x_cmp_170hx_with_vllm_tp2.md)にあります。
+
+| 深度 | プリフィル（新規トークン/s） | デコード、合成テキスト | デコード、実運用相当の生成 |
+|---|---|---|---|
+| 32K | 3,323 | 186.2（MTP採択率0.94） | 97.1（0.39） |
+| 128K | 2,994 | 184.6（0.95） | 89.1（0.35） |
+| 258K | 2,575 | 178.3（0.93） | 69.7（0.21） |
+
+2つのデコード列の2.6倍の差は、MTP の採択率の違いだけで説明できます。MTP 付きのモデルを
+合成テキストのラダーだけで測ると、デコードを大きく見積もりすぎます。この heretic-2 の数値は、
+ベースのチェックポイントを `bench/bench.py` で測った下の[結果](#結果)の表とは直接比べられません。
+
 ## ハードウェア（実測）
 
 | | |
@@ -45,9 +89,11 @@ KV 1,486,412トークン・ツール呼び出し対応。**
 
 ## 結果
 
-既定の構成：`--max-model-len 262144`、MTP k=4、`--max-num-seqs 8`、
-`--max-num-batched-tokens 1024`、BF16 KV、`--kv-cache-memory` はカードを使い切る値。
-「64K」と付いた行は、既定を変える前に `--max-model-len 65536` で測ったものです。
+**ベースの Vnimanie チェックポイント**を、当時の既定の構成で測った結果です：
+`--max-model-len 262144`、MTP k=4、`--max-num-seqs 8`、`--max-num-batched-tokens 1024`、
+BF16 KV、`--kv-cache-memory 24383208960`（カードを使い切る値）。
+「64K」と付いた行は、その既定を変える前に `--max-model-len 65536` で測ったものです。
+今の既定値は[バッチトークン数とKVサイズ](#バッチトークン数とkvサイズ)にあります。
 
 ### デコード、1本（tok/s、3回の中央値、最大512トークン）
 
@@ -89,11 +135,28 @@ MTPの効果は、散文で約1.6倍、コードで約2.6倍です。kを増や�
 
 | 試したこと | 結果 |
 |---|---|
-| `--max-num-batched-tokens 4096` | 7Kトークンのプリフィルで500エラー。デコードは変わらず |
+| `--max-num-batched-tokens 4096`、KVはカードを使い切る値（24383208960） | 7Kトークンのプリフィルで500エラー。デコードは変わらず。KVを減らせば8192でも動く（下記） |
 | `VLLM_COMPILE`（inductor） | 問題なく起動する（古い資料にある「止まる」は起きない）。ただしデコードは速くならず（124 / 101 / 112 / 176）、起動が30秒遅くなる |
 | `--pipeline-parallel-size 2` | 起動時に拒否：`VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
 | `cudagraph_mode: FULL` | vLLMが `FULL_DECODE_ONLY` に格下げする（QSAバックエンドが均一バッチにしか対応していない） |
 | FP8 KV（`fp8_e4m3`、alesha-proのQSAオーバーレイ、この構成用にキャリブレーション） | 動くが、ここでは使う価値がない（下記） |
+
+### バッチトークン数とKVサイズ
+
+`--max-num-batched-tokens 8192`（以前の1024の8倍）にすると、プリフィルの中間データ用の
+メモリが要ります。カードを使い切るKVでは、その余地がありません。しかも `--kv-cache-memory` を
+明示すると、その分を確保するはずのプロファイリングが行われません。8192・heretic-2 で、
+1枚あたりの値ごとに実測した結果です。
+
+| `--kv-cache-memory` | 結果 |
+|---|---|
+| 21213949952（19.76GiB）、vLLM自身が「GPUメモリを使い切る値」として出す推奨値 | 8.9Kトークンのプリフィルで実行中にOOM |
+| **18897856102（17.6GiB）、既定** | KV 1,151,760トークン、262Kで同時4.39本分。33Kトークン×8本の並列が通る。ピーク 64,783 / 65,536MiB で、**余裕は753MiBだけ** |
+| 空（`--gpu-memory-utilization 0.92` で決める。15.5GiB） | KV 1,016,505トークン。安全側 |
+
+17.6GiBは余裕がわずかです。OOMになったら `KV_CACHE_MEMORY= ./scripts/run.sh` で割合指定に
+戻せます。`MAX_NUM_BATCHED_TOKENS=1024 KV_CACHE_MEMORY=24383208960` にすれば、結果の表を
+測ったときの構成に戻ります。
 
 ### FP8 KVキャッシュ
 
@@ -127,7 +190,8 @@ MTPの効果は、散文で約1.6倍、コードで約2.6倍です。kを増や�
 | | 1枚あたり | 合計 |
 |---|---|---|
 | 重み＋torch以外（MTPヘッド含む） | 38.7GiB | 77.4GiB |
-| KVキャッシュ（BF16） | 22.7GiB | 45.4GiB → コンテキスト262Kで1,486,412トークン |
+| KVキャッシュ（BF16）、計測時 | 22.7GiB | 45.4GiB → コンテキスト262Kで1,486,412トークン |
+| KVキャッシュ（BF16）、今の既定 | 17.6GiB | 35.2GiB → 1,151,760トークン |
 | メインメモリ、コンテナ全体 | – | 61.2GiB（うちPLEワーカー48.4GiB） |
 
 起動は約**5分50秒**です（本体の重み103秒、MTPドラフター9秒、FP8 PLE約40秒、
@@ -153,7 +217,9 @@ lowとmediumはすべて回答まで書き切りました。**xhighは6回中5�
 
 - **64GBのsm_80カード2枚。** 確認済みなのはCMP 170HXのみです。
 - **メインメモリの空き約64GiB。** コンテナの実測は61.2GiB。この92GiBのマシンでは残り約31GiBです。
-- **ディスク約260GB。** チェックポイント179.8GB＋FP8 PLE 51.3GB＋イメージ28.8GB。
+- **準備中はディスク約335GB。** ベースのチェックポイント179.8GB＋heretic-2 74GB＋
+  FP8 PLE 51.3GB＋イメージ28.8GB。`prepare-heretic2.sh` と `build-ple-fp8.sh` が終われば
+  ベースは削除でき、約155GBになります。
 - NVIDIAランタイム付きのDocker、CUDA 13.0のイメージが動くドライバ。
 - 170HXの速度がここの数字に全然届かない場合は、まずマザーボードの `PWRBRK#` パワー
   ブレーキを疑ってください。
@@ -166,9 +232,11 @@ lowとmediumはすべて回答まで書き切りました。**xhighは6回中5�
 git clone https://github.com/moriyasujapan/qwen38-flash-next-vllm-2x170hx
 cd qwen38-flash-next-vllm-2x170hx
 
-./scripts/setup.sh            # 固定版オーバーレイ＋vLLMイメージ（28.8GB）
-./scripts/download-model.sh   # 179.8GB、帯域制限あり（RATE=95M）、再開可能
-./scripts/build-ple-fp8.sh    # BF16 PLE → FP8＋マニフェスト
+./scripts/setup.sh              # 固定版オーバーレイ＋vLLMイメージ（28.8GB）
+./scripts/download-model.sh     # ベースのW4A16、179.8GB、帯域制限あり（RATE=95M）、再開可能
+./scripts/build-ple-fp8.sh      # BF16 PLE → FP8＋マニフェスト
+./scripts/download-heretic2.sh  # heretic-2のW4A16、74GB、sha256検証つき、再開可能
+./scripts/prepare-heretic2.sh   # GPTQ設定、ベースのトークナイザー、MTPヘッドの移植
 
 GPUS=1,2 ./scripts/run.sh     # 170HX 2枚をインデックスかUUIDで指定（nvidia-smi -L）
 until curl -sf localhost:18024/health; do sleep 10; done
@@ -188,11 +256,12 @@ python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
 | `--speculative-config` | MTP、k=4 | コードで最速、散文は同等（上の表） |
 | `--max-model-len` | 262144 | モデル本来の上限。上げても短いリクエストは遅くならなかった |
 | `--max-num-seqs` | 8 | 同時4で合計約3倍、1本の速度は変わらない |
-| `--max-num-batched-tokens` | 1024 | 4096は7Kのプリフィルで500エラー |
+| `--max-num-batched-tokens` | 8192 | 下のKVサイズなら動く。KVを使い切る値では4096でも500エラー |
 | `--compilation-config` | `{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}` | inductorは効果なし、FULLは格下げされる |
-| `--kv-cache-memory` | 24383208960 | 64GBカードを使い切る値。割合指定では1枚あたり4.35GiB余っていた |
+| `--kv-cache-memory` | 18897856102 | 8192トークンのプリフィルに耐えた最大の実測値。vLLMの推奨値ではOOM |
 | `--kv-cache-dtype` | `auto`（BF16） | FP8 KVを実測：容量+36%、デコード6〜11%低下 |
 | `VLLM_PLE_EMBEDDING_DTYPE` | `float8_e4m3fn` | オーバーレイのFP8 PLE経路を選ぶ |
+| `VLLM_HTTP_TIMEOUT_KEEP_ALIVE` | 75 | 既定の5秒だと、LiteLLMゲートウェイが再利用しようとした待機中の接続をvLLMが閉じてしまう（"Server disconnected"） |
 | `--cap-add SYS_PTRACE --security-opt seccomp=unconfined` | 元レシピのまま | PLEオフロードが `pidfd_getfd` を使う。外した場合は未検証 |
 
 ## 計測方法
@@ -213,6 +282,8 @@ python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
 ## クレジット
 
 - モデル：Qwen。W4A16量子化：[VnimanieAI](https://huggingface.co/VnimanieAI/Qwen3.8-Flash-Next-W4A16)
+- heretic-2：[trohrbaugh](https://huggingface.co/trohrbaugh/Qwen3.8-Flash-Next-heretic-2)。
+  そのW4A16量子化：[densohax](https://huggingface.co/densohax/Qwen3.8-Flash-Next-heretic2-W4A16-FP8PLE)
 - PLEオフロードのオーバーレイとマニフェストツール：
   [alesha-pro/qwen38-flash-next-4x3090](https://github.com/alesha-pro/qwen38-flash-next-4x3090)
   （固定コミットを参照。本リポジトリには同梱していません）
