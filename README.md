@@ -137,7 +137,7 @@ first pass over a long document pays the prefill.
 |---|---|
 | `--max-num-batched-tokens 4096` with the full-card KV (24383208960) | HTTP 500 on a 7K-token prefill; decode unchanged. With a smaller KV, 8192 works — see below |
 | `VLLM_COMPILE` (inductor) | starts fine — it does **not** hang, despite older notes — but decodes no faster (124 / 101 / 112 / 176) and starts 30 s slower |
-| `--pipeline-parallel-size 2` | refused at startup: `VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
+| `--pipeline-parallel-size 2` | refused at startup: `VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2`. It does work on the upstream build — see [The upstream build is faster than this one](#the-upstream-build-is-faster-than-this-one) |
 | `cudagraph_mode: FULL` | downgraded by vLLM to `FULL_DECODE_ONLY` (the QSA backend supports uniform batches only) |
 | FP8 KV (`fp8_e4m3`, alesha-pro's QSA overlays, scales calibrated for this composition) | works, but not worth it here — see below |
 
@@ -212,6 +212,135 @@ answered in 5 of 6 runs** — about three minutes of nothing each. Send
 `chat_template_kwargs: {"reasoning_effort": "medium"}` (valid values: `xhigh`, `medium`,
 `low`; `high` is rejected). Clients that do not send it get `xhigh`.
 
+## The upstream build is faster than this one
+
+Since 2026-11-10 there is a second way to serve this checkpoint: upstream vLLM's
+own wheel plus the [`vllm-cmp170hx`](https://github.com/AlexBrandes/vllm) platform
+plugin, packaged by [AlexBrandes](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next).
+It beat this repository's build on every axis measured, so the recipe here is kept
+for reference and rollback rather than as the recommendation.
+
+Both arms served **the same** heretic-2 W4A16 checkpoint with the same FP8 PLE, the
+same prompts, and `bench/bench.py`'s decode definition (TTFT excluded). Every arm
+idle-gated on `num_requests_running == 0` and took 8 warm-up requests first. Raw
+data: [`results/2026-11-10-upstream-build-comparison.jsonl`](results/2026-11-10-upstream-build-comparison.jsonl).
+
+| | this repository | upstream + plugin |
+|---|---|---|
+| vLLM | `0.1.dev20073+g8e685d198` (a fork; the commit is not in upstream) | `0.33.0rc1.dev659+ga0d7356b9` (official wheel) |
+| 170HX support | patch stack + overlays, pinned to `alesha-pro@9b36aae` | `vllm-cmp170hx 0.2.0` platform plugin |
+| PLE | `VLLM_PLE_CPU_OFFLOAD=1`, 47 GiB resident in host RAM | `--engram-config {"disk_offload":true}`, `preadv` per step, 32-thread gather |
+
+### Decode, single stream (tok/s, median of 6)
+
+| prompt | this repository | upstream | upstream + nvfp4 draft head |
+|---|---|---|---|
+| code | 225 | 241 | **266** |
+| en prose | 82 | 79 | **95** |
+| `banana` ×80 | 281 | 895 | **696** (peak 2,151) |
+
+Acceptance length is the same on both builds, so these are engine-side gains, not
+better drafting. The `banana` row is the clean case: `ms/step` falls from 5.7 to
+**2.3 ms**.
+
+### Concurrency (aggregate tok/s, best of 3, 400-token answers)
+
+| concurrent | this repository | stalls | upstream | stalls |
+|---:|---:|---:|---:|---:|
+| 1 | 213.6 | 0 | **310.9** | 0 |
+| 3 | 511.3 | 0 | **776.4** | 0 |
+| 4 | 449.8 | **6** | **673.8** | 0 |
+| 6 | 455.7 | **16** | **848.4** | 0 |
+| 8 | 863.8 | **10** | **992.9** | 0 |
+| 9 | 1042.3 | 0 | **1378.3** | 0 |
+| 11 | 945.5 | **6** | **1106.4** | 0 |
+
+The dips at 4, 6, 8 and 11 concurrent requests are exactly where this build stalls.
+On the upstream build those stalls do not happen at any level: `ITLmax` stays
+23–64 ms throughout. Peak is **1,378 tok/s at 9 concurrent**.
+
+### `--pipeline-parallel-size 2` works there, and is still slower
+
+[Things that did not help](#things-that-did-not-help) records that PP is refused
+here, because `VLLM_PLE_CPU_OFFLOAD` rejects `pipeline_parallel_size != 1`.
+Upstream's `disk_offload` carries no such restriction, so TP1 + PP2 with expert
+parallel **off** boots normally — VRAM splits 51,152 / 59,168 MiB, and the quant
+divisibility that forces EP under TP2 stops mattering because PP splits layers, not
+`moe_intermediate`. It is still 5% slower than TP2 + EP (code 252.5 against 266.4,
+en prose 87.9 against 93.2), so TP2 + EP stays the right choice on these cards.
+
+### `tool_choice` is broken here and fixed there
+
+| | this repository | upstream |
+|---|---|---|
+| `tool_choice: "required"`, non-streaming, 12 requests | **12 violated** | **0 violated** |
+| streaming × thinking, 4 combinations | 1 worked | **4 worked** |
+| xgrammar `Failed to advance FSM` + matcher warnings | **215** | **0** in 55 requests |
+
+On this build `tool_choice: "required"` silently degrades to `auto`, and
+`finish_reason` is still rewritten to `"tool_calls"` while `tool_calls` stays empty —
+a self-contradictory response that breaks any client trusting `finish_reason`.
+The cause: `VLLM_ENFORCE_STRICT_TOOL_CALLING` defaults to `True`, which sets
+`supports_required_and_named = False` on any parser carrying a
+`structural_tag_model` (ours does, `qwen_3_coder`), so required and named tool
+choice fall back to the `auto` path; and the grammar that should have enforced it is
+built with `reasoning=False` hardcoded, which demands `<tool_call>` as the very
+first output and therefore cannot match a thinking model. Upstream's
+`ToolStrictLevel` and `constraint_start` resolve both.
+
+### Where the memory goes, on the other build
+
+| | this repository | upstream |
+|---|---|---|
+| host RAM used | 69–70 GiB | **20 GiB** |
+| host RAM available | 53 GiB | **103 GiB** |
+| VRAM per card | 61,545 MiB | 59,536 MiB |
+
+`disk_offload` reads each step's PLE rows with `preadv` instead of holding the table,
+so the 47 GiB comes back to the host. Measured read load peaks at **2.4 MB/s** —
+the code prompt reads 0.0–0.4 MB per request — against a PCIe 4.0 ×4 link, with
+only 5–21% of the 47.7 GiB table resident in page cache. Contention is not a
+throughput risk, but the table now lives on its own NVMe here anyway, so
+distillation and video generation can share the host again.
+
+One trap: right after moving the table to another disk the numbers look bad (code
+40–53 tok/s) purely because page cache is cold. Residency climbed 5.1% → 21.3% over
+a few minutes and decode returned to 268–287. **Wait for the cache before measuring.**
+
+### `draft_lm_head_quantization`
+
+Upstream takes one config line to quantize the drafter's copy of the shared
+`lm_head`, which this build has no equivalent for:
+
+```
+--speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_lm_head_quantization":"nvfp4"}'
+```
+
+Measured on and off, same build: code 240.8 → **266.4** (+10.6%), en prose
+78.8 → **94.9** (+20.5%). Acceptance length does not move, which is what upstream
+documents — the target still verifies with its own head.
+
+### What neither build fixes
+
+Single requests stall on both. The en-prose prompt stalls in nearly every run
+(3–14 occurrences, `ITLmax` 332–1,090 ms) while `ms/step` p50 holds a steady
+25–31 ms. Ten candidates were measured and eliminated: the power cap, swap, major
+page faults, PLE host gather, preemption, acceptance variance, prefix caching,
+CUDA-graph misses, TP/EP all-to-all, and disk I/O.
+
+What the measurements say: the work per request is identical (~35 steps, ~4.8
+tokens/step, 0 preemptions) while wall time spreads 6×; the GPU is busy at 86–88%
+*during* a stall; slow runs burn 2–3× more CPU; the code prompt stalls while reading
+**0.0 MB** from disk; and PP2 — no TP, no EP, no all-to-all — stalls the same. It
+tracks prompt content: `banana` ×80 almost never stalls, en prose almost always
+does. That points at the kernels or the routing rather than at configuration, and it
+is unexplained.
+
+En prose is also slow for a second, fully explained reason: acceptance length is
+2.45–2.75 against 4.5–4.8 for code and `banana`. The MTP head served here was
+distilled on this model's own **Japanese** answers, so English prose does not draft
+well. No build change fixes that; re-distilling with English data would.
+
 ## Requirements
 
 - **Two 64 GB sm_80 cards.** Only CMP 170HX has been tested.
@@ -279,6 +408,10 @@ an optional LiteLLM front end. Every path and setting is an environment variable
   how the document began; an early FP8 "failure" turned out to be this, not the cache.
 
 ## Credits
+
+[AlexBrandes](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next) authored the
+upstream-wheel-plus-plugin build this repository now measures itself against, and the
+`vllm-cmp170hx` platform plugin behind it.
 
 - Qwen for the model; [VnimanieAI](https://huggingface.co/VnimanieAI/Qwen3.8-Flash-Next-W4A16)
   for the W4A16 quantization.
