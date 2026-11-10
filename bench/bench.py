@@ -3,6 +3,8 @@
 
     python3 bench/bench.py [--label NAME] [--reps 3] [--prefill 8192,32768]
                            [--conc 1,4,8] [--skip-decode] [--out results.jsonl]
+                           [--idle-gate] [--warmup 1]
+                           [--protocol default|sparkdash]
 
 decode   : four prompts x --reps, streaming. decode tok/s = (completion_tokens - 1)
            / (t_last_token - t_first_token), so TTFT is excluded. Completion
@@ -13,6 +15,23 @@ prefill  : synthetic prompts of roughly the given lengths, one output token.
 conc     : N identical code requests fired together; aggregate tok/s = total
            completion tokens / wall time. Needs --max-num-seqs >= N to mean
            what it says; otherwise requests queue.
+
+--idle-gate waits for /metrics to report no running and no waiting request
+before every measured request, and re-checks after a short settle. Use it
+whenever anything else can reach the server: co-tenant traffic inflates the
+batch, changes the CUDA-graph shape, and silently depresses decode rates.
+--warmup N sends N throwaway requests of the real prompt first; one is not
+always enough, because decode climbs over the first few requests.
+
+--protocol sparkdash swaps the sampling for the one sparkDash 3e6d4ef uses, the
+protocol AlexBrandes publishes his CMP 170HX numbers with: temperature 0, top_p
+1, thinking off, and the output length pinned with min_tokens + ignore_eos. The
+tok/s formula is unchanged. Pinning all three makes every repetition generate the
+same text at the same length, which is what gets the spread down to a few percent
+on this model -- MTP acceptance is content-dependent, so under the default
+protocol (temperature 0.7, thinking on, natural length) the same cell can swing
+2x. Use sparkdash to compare builds or to compare against other 170HX hosts; use
+the default protocol for what the deployment actually feels like.
 
 Standard library only.
 """
@@ -40,11 +59,28 @@ FILLER = ("The quick brown fox jumps over the lazy dog while the committee debat
           "東京の天気は晴れで、午後から少し雲が広がる見込みです。 ")
 
 
-def stream(messages, max_tokens, temperature=0.7):
-    body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens,
-            "temperature": temperature, "top_p": 0.95, "stream": True,
-            "stream_options": {"include_usage": True},
-            "chat_template_kwargs": {"reasoning_effort": "medium"}}
+PROTOCOL = "default"
+
+
+def stream(messages, max_tokens, temperature=0.7, pin_length=True):
+    """One streaming request. Sampling follows --protocol."""
+    if PROTOCOL == "sparkdash":
+        # sparkDash 3e6d4ef: greedy, thinking off, output length pinned.
+        body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens,
+                "temperature": 0, "top_p": 1, "stream": True,
+                "stream_options": {"include_usage": True},
+                "chat_template_kwargs": {"enable_thinking": False}}
+        if pin_length:
+            # Forces exactly max_tokens, so every repetition decodes the same
+            # amount of work. Without it the model stops where it likes and the
+            # rate moves with the answer.
+            body["min_tokens"] = max_tokens
+            body["ignore_eos"] = True
+    else:
+        body = {"model": MODEL, "messages": messages, "max_tokens": max_tokens,
+                "temperature": temperature, "top_p": 0.95, "stream": True,
+                "stream_options": {"include_usage": True},
+                "chat_template_kwargs": {"reasoning_effort": "medium"}}
     req = urllib.request.Request(BASE + "/v1/chat/completions",
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -70,6 +106,42 @@ def stream(messages, max_tokens, temperature=0.7):
             "completion_tokens": usage.get("completion_tokens", 0)}
 
 
+IDLE_GATE = False
+
+
+def _gauge(text, name):
+    for line in text.splitlines():
+        if line.startswith(f"vllm:{name}{{"):
+            return float(line.rsplit(" ", 1)[1])
+    return 0.0
+
+
+def wait_idle(timeout=180.0):
+    """Block until the server reports no running and no waiting request."""
+    if not IDLE_GATE:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            text = urllib.request.urlopen(BASE + "/metrics", timeout=10).read().decode()
+        except Exception:
+            time.sleep(0.5)
+            continue
+        busy = (_gauge(text, "num_requests_running")
+                + _gauge(text, "num_requests_waiting"))
+        if busy == 0:
+            time.sleep(0.4)          # settle, then confirm it stayed idle
+            try:
+                text = urllib.request.urlopen(BASE + "/metrics", timeout=10).read().decode()
+            except Exception:
+                continue
+            if _gauge(text, "num_requests_running") == 0:
+                return True
+        time.sleep(0.5)
+    print("  WARNING: server never went idle; this sample is contaminated", flush=True)
+    return False
+
+
 def decode_rate(r):
     n = r["completion_tokens"]
     if not r["t_first"] or n < 2 or r["t_last"] <= r["t_first"]:
@@ -78,16 +150,19 @@ def decode_rate(r):
 
 
 def summary(xs):
-    return {"median": round(statistics.median(xs), 1), "min": round(min(xs), 1),
-            "max": round(max(xs), 1), "n": len(xs)}
+    med = statistics.median(xs)
+    spread = (max(xs) - min(xs)) / med * 100 if med else 0.0
+    return {"median": round(med, 1), "min": round(min(xs), 1),
+            "max": round(max(xs), 1), "spread_pct": round(spread, 1), "n": len(xs)}
 
 
-def bench_decode(reps):
+def bench_decode(reps, max_tokens=512):
     per, allr = {}, []
     for name, prompt in DECODE_PROMPTS.items():
         rates = []
         for _ in range(reps):
-            r = stream([{"role": "user", "content": prompt}], 512)
+            wait_idle()
+            r = stream([{"role": "user", "content": prompt}], max_tokens)
             rates.append(decode_rate(r))
         per[name] = summary(rates)
         allr += rates
@@ -101,12 +176,14 @@ def bench_prefill(lengths, reps=2):
     for target in lengths:
         rates, ptoks, ttfts = [], [], []
         for _ in range(reps):
+            wait_idle()
             nonce = "".join(random.choices(string.ascii_letters, k=16))
             # ~3.2 characters per token for this filler; the server reports the
             # real count, which is what the rate uses.
             text = nonce + "\n" + FILLER * max(1, int(target * 3.2 / unit))
             r = stream([{"role": "user",
-                         "content": text + "\n\nSummarise the above in one word."}], 1)
+                         "content": text + "\n\nSummarise the above in one word."}], 1,
+                       pin_length=False)
             rates.append(r["prompt_tokens"] / r["ttft"])
             ptoks.append(r["prompt_tokens"])
             ttfts.append(round(r["ttft"], 2))
@@ -116,15 +193,16 @@ def bench_prefill(lengths, reps=2):
     return out
 
 
-def bench_conc(levels):
+def bench_conc(levels, conc_max_tokens=256):
     out = {}
     prompt = [{"role": "user", "content": DECODE_PROMPTS["code"]}]
     for n in levels:
         results = [None] * n
 
         def run(i):
-            results[i] = stream(prompt, 256)
+            results[i] = stream(prompt, conc_max_tokens)
         threads = [threading.Thread(target=run, args=(i,)) for i in range(n)]
+        wait_idle()
         t0 = time.time()
         for t in threads:
             t.start()
@@ -148,17 +226,35 @@ def main():
     ap.add_argument("--conc", default="")
     ap.add_argument("--skip-decode", action="store_true")
     ap.add_argument("--out", default="")
+    ap.add_argument("--idle-gate", action="store_true",
+                    help="wait for an idle server before every measured request")
+    ap.add_argument("--warmup", type=int, default=1,
+                    help="throwaway requests before measuring (8 is plenty)")
+    ap.add_argument("--protocol", choices=("default", "sparkdash"), default="default",
+                    help="sampling protocol; sparkdash pins text and length")
+    ap.add_argument("--max-tokens", type=int, default=0,
+                    help="decode output length (default 512, sparkdash 400)")
     a = ap.parse_args()
 
-    # One throwaway request so the first measured one is not paying warmup.
-    stream([{"role": "user", "content": "hi"}], 8)
-    res = {"label": a.label, "time": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    global IDLE_GATE, PROTOCOL
+    IDLE_GATE = a.idle_gate
+    PROTOCOL = a.protocol
+    max_tokens = a.max_tokens or (400 if PROTOCOL == "sparkdash" else 512)
+
+    # Throwaway requests so the first measured one is not paying warmup. Decode
+    # climbs over the first few requests, so one is not always enough.
+    warmup_tokens = 32 if PROTOCOL == "sparkdash" else 256
+    for _ in range(max(0, a.warmup)):
+        stream([{"role": "user", "content": DECODE_PROMPTS["code"]}], warmup_tokens)
+    res = {"label": a.label, "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "protocol": PROTOCOL, "max_tokens": max_tokens,
+           "idle_gate": IDLE_GATE, "warmup": a.warmup}
     if not a.skip_decode:
-        res["decode"] = bench_decode(a.reps)
+        res["decode"] = bench_decode(a.reps, max_tokens)
     if a.prefill:
         res["prefill"] = bench_prefill([int(x) for x in a.prefill.split(",")])
     if a.conc:
-        res["conc"] = bench_conc([int(x) for x in a.conc.split(",")])
+        res["conc"] = bench_conc([int(x) for x in a.conc.split(",")], max_tokens)
     if a.out:
         with open(a.out, "a") as f:
             f.write(json.dumps(res, ensure_ascii=False) + "\n")
