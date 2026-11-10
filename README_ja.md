@@ -137,7 +137,7 @@ MTPの効果は、散文で約1.6倍、コードで約2.6倍です。kを増や�
 |---|---|
 | `--max-num-batched-tokens 4096`、KVはカードを使い切る値（24383208960） | 7Kトークンのプリフィルで500エラー。デコードは変わらず。KVを減らせば8192でも動く（下記） |
 | `VLLM_COMPILE`（inductor） | 問題なく起動する（古い資料にある「止まる」は起きない）。ただしデコードは速くならず（124 / 101 / 112 / 176）、起動が30秒遅くなる |
-| `--pipeline-parallel-size 2` | 起動時に拒否：`VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2` |
+| `--pipeline-parallel-size 2` | 起動時に拒否：`VLLM_PLE_CPU_OFFLOAD does not support the requested configuration. Unsupported settings: PP=2`。upstream のビルドでは動く（[upstream のビルドのほうが速い](#upstream-のビルドのほうが速い)） |
 | `cudagraph_mode: FULL` | vLLMが `FULL_DECODE_ONLY` に格下げする（QSAバックエンドが均一バッチにしか対応していない） |
 | FP8 KV（`fp8_e4m3`、alesha-proのQSAオーバーレイ、この構成用にキャリブレーション） | 動くが、ここでは使う価値がない（下記） |
 
@@ -213,6 +213,131 @@ lowとmediumはすべて回答まで書き切りました。**xhighは6回中5�
 `chat_template_kwargs: {"reasoning_effort": "medium"}` を送ってください（有効な値は `xhigh`・
 `medium`・`low` で、`high` はエラー）。指定しないクライアントは `xhigh` になります。
 
+## upstream のビルドのほうが速い
+
+2026年11月10日から、このチェックポイントを動かす方法がもう一つあります。upstream の
+vLLM 公式 wheel に [`vllm-cmp170hx`](https://github.com/AlexBrandes/vllm) プラットフォーム
+プラグインを足したもので、[AlexBrandes](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next)
+がパッケージしています。計測したすべての項目で本リポジトリのビルドを上回ったので、ここの
+レシピは推奨ではなく、参照とロールバック用として残します。
+
+両方とも**同じ** heretic-2 W4A16 チェックポイント、同じ FP8 PLE、同じプロンプト、
+`bench/bench.py` と同じデコード定義（TTFT を除外）で測っています。どちらも
+`num_requests_running == 0` を待ってから計測し、事前にウォームアップを8回回しました。
+生データは [`results/2026-11-10-upstream-build-comparison.jsonl`](results/2026-11-10-upstream-build-comparison.jsonl)
+にあります。
+
+| | 本リポジトリ | upstream + プラグイン |
+|---|---|---|
+| vLLM | `0.1.dev20073+g8e685d198`（フォーク。このコミットは upstream に存在しません） | `0.33.0rc1.dev659+ga0d7356b9`（公式 wheel） |
+| 170HX 対応 | パッチ群とオーバーレイ（`alesha-pro@9b36aae` に固定） | `vllm-cmp170hx 0.2.0` プラットフォームプラグイン |
+| PLE | `VLLM_PLE_CPU_OFFLOAD=1`、47GiB をホストRAMに常駐 | `--engram-config {"disk_offload":true}`、ステップごとに `preadv`、32スレッドで読み出し |
+
+### デコード、1本（tok/s、6回の中央値）
+
+| プロンプト | 本リポジトリ | upstream | upstream + nvfp4 ドラフトヘッド |
+|---|---|---|---|
+| コード | 225 | 241 | **266** |
+| 英語の散文 | 82 | 79 | **95** |
+| `banana` ×80 | 281 | 895 | **696**（最高 2,151） |
+
+受理長は両ビルドで同じなので、これはドラフトが良くなったのではなくエンジン側の差です。
+`banana` の行がいちばん分かりやすく、1ステップが 5.7ms から **2.3ms** に下がります。
+
+### 同時リクエスト（合計tok/s、3回の最良値、400トークンの回答）
+
+| 同時数 | 本リポジトリ | ストール | upstream | ストール |
+|---:|---:|---:|---:|---:|
+| 1 | 213.6 | 0 | **310.9** | 0 |
+| 3 | 511.3 | 0 | **776.4** | 0 |
+| 4 | 449.8 | **6** | **673.8** | 0 |
+| 6 | 455.7 | **16** | **848.4** | 0 |
+| 8 | 863.8 | **10** | **992.9** | 0 |
+| 9 | 1042.3 | 0 | **1378.3** | 0 |
+| 11 | 945.5 | **6** | **1106.4** | 0 |
+
+同時4本・6本・8本・11本で落ち込んでいるのは、このビルドがストールしている箇所とぴったり
+一致します。upstream のビルドではどの同時数でもストールが起きず、`ITLmax` は 23〜64ms に
+収まりました。最高は**同時9本で 1,378 tok/s** です。
+
+### `--pipeline-parallel-size 2` は向こうでは動く。それでも遅い
+
+[効果がなかったもの](#効果がなかったもの)に書いたとおり、ここでは PP は拒否されます。
+`VLLM_PLE_CPU_OFFLOAD` が `pipeline_parallel_size != 1` を受け付けないからです。upstream の
+`disk_offload` にはその制約がないので、TP1 + PP2（エキスパート並列は**切る**）で普通に
+起動します。VRAM は 51,152 / 59,168 MiB に分かれて層分割が効いていることが分かり、TP2 で
+EP が必須になる量子化の割り切れ問題も、PP は層を分けるだけで `moe_intermediate` を割らない
+ので関係なくなります。ただし TP2 + EP より 5% 遅く（コード 252.5 対 266.4、英語の散文
+87.9 対 93.2）、このカードでは TP2 + EP のままが正解です。
+
+### `tool_choice` はここでは壊れていて、向こうでは直っている
+
+| | 本リポジトリ | upstream |
+|---|---|---|
+| `tool_choice: "required"`、非ストリーム、12回 | **12回違反** | **0回違反** |
+| ストリーム × thinking の4通り | 1通りだけ成功 | **4通りすべて成功** |
+| xgrammar の `Failed to advance FSM` と matcher 警告 | **215件** | 55リクエストで**0件** |
+
+このビルドでは `tool_choice: "required"` が黙って `auto` に落ち、それでも `finish_reason` は
+`"tool_calls"` に書き換えられて `tool_calls` は空のまま返ります。`finish_reason` を信じる
+クライアントは壊れます。原因は、`VLLM_ENFORCE_STRICT_TOOL_CALLING` の既定が `True` で、
+`structural_tag_model` を持つパーサ（このモデルは `qwen_3_coder` で持っています）の
+`supports_required_and_named` が `False` にされ、required と named が `auto` の経路に
+フォールバックすること。そして本来それを強制すべき文法が `reasoning=False` 固定で作られ、
+出力の先頭が `<tool_call>` であることを要求するため、thinking するモデルでは一致しない
+ことです。upstream の `ToolStrictLevel` と `constraint_start` が両方を解決しています。
+
+### メモリの内訳（向こうのビルド）
+
+| | 本リポジトリ | upstream |
+|---|---|---|
+| ホストRAM使用 | 69〜70GiB | **20GiB** |
+| ホストRAM空き | 53GiB | **103GiB** |
+| VRAM（1枚あたり） | 61,545MiB | 59,536MiB |
+
+`disk_offload` はテーブルを保持せずステップごとに必要な PLE 行を `preadv` で読むので、
+47GiB がホストに返ってきます。実測の読み出しは**ピークで 2.4MB/s**（コードのプロンプトは
+1リクエストで 0.0〜0.4MB）で、相手は PCIe 4.0 ×4、47.7GiB のテーブルのうちページキャッシュ
+常駐は5〜21%でした。スループット上の競合リスクはありませんが、ここではテーブルを専用の
+NVMe に移したので、蒸留や動画生成とホストを共有できます。
+
+ひとつ罠があります。テーブルを別のディスクに移した直後は数字が悪く見えます（コード
+40〜53 tok/s）が、これは単にページキャッシュが冷えているためです。数分で常駐率が5.1%から
+21.3%に上がり、デコードは 268〜287 に戻りました。**キャッシュが温まるまで測らないこと。**
+
+### `draft_lm_head_quantization`
+
+upstream には、ドラフタが共有する `lm_head` のコピーを量子化する設定が1行あります。
+このビルドに相当するものはありません。
+
+```
+--speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_lm_head_quantization":"nvfp4"}'
+```
+
+同じビルドでオンとオフを測ると、コード 240.8 → **266.4**（+10.6%）、英語の散文
+78.8 → **94.9**（+20.5%）。受理長は動かず、これは upstream が書いているとおりです
+（検証はターゲットが自分のヘッドで行うため）。
+
+### どちらのビルドでも直らないもの
+
+1本のリクエストが、どちらのビルドでもストールします。英語の散文はほぼ毎回ストールし
+（3〜14回、`ITLmax` 332〜1,090ms）、その間も1ステップの中央値は 25〜31ms で安定しています。
+10個の候補を測って、すべて否定しました。電力上限、スワップ、メジャーページフォルト、
+PLE のホスト側読み出し、プリエンプション、受理率のばらつき、プレフィックスキャッシュ、
+CUDA グラフの不一致、TP/EP の all-to-all、ディスクI/O です。
+
+測って分かったこと。1リクエストあたりの仕事量は同じ（約35ステップ、1ステップ約4.8トークン、
+プリエンプション0）なのに所要時間は6倍ばらつく。ストール中も GPU は 86〜88% で動いている。
+遅い回はCPUを2〜3倍使う。コードのプロンプトはディスクを**0.0MB**しか読まずにストールする。
+そして PP2（TPなし、EPなし、集団通信なし）でも同じようにストールする。プロンプトの内容に
+依存し、`banana` ×80 はほとんどストールせず、英語の散文はほぼ必ずストールします。設定では
+なくカーネルかルーティング側を示していますが、原因は分かっていません。
+
+英語の散文が遅いのには、もう一つはっきりした理由があります。受理長がコードや `banana` の
+4.5〜4.8 に対して 2.45〜2.75 しかありません。ここで使っている MTP ヘッドは、このモデル自身の
+**日本語**の回答で蒸留したものなので、英語の散文ではドラフトが当たりません。これはビルドを
+変えても直らず、英語データを混ぜて蒸留し直す必要があります。
+
 ## 必要なもの
 
 - **64GBのsm_80カード2枚。** 確認済みなのはCMP 170HXのみです。
@@ -280,6 +405,10 @@ python3 bench/bench.py --reps 3 --prefill 8192,32768 --conc 1,4,8
   見えた初期の結果は、キャッシュではなくこれが原因でした。
 
 ## クレジット
+
+本リポジトリが自らの比較対象にしている upstream wheel + プラグイン版と、その土台の
+`vllm-cmp170hx` プラットフォームプラグインは
+[AlexBrandes](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next) によるものです。
 
 - モデル：Qwen。W4A16量子化：[VnimanieAI](https://huggingface.co/VnimanieAI/Qwen3.8-Flash-Next-W4A16)
 - heretic-2：[trohrbaugh](https://huggingface.co/trohrbaugh/Qwen3.8-Flash-Next-heretic-2)。
