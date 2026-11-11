@@ -359,23 +359,50 @@ A fourth, cheaper note: `docker restart` reaches `/health` in under three minute
 against roughly twelve for a fresh `run`, because the JIT and inductor caches
 survive in `models/.vllm-cache`. Use it when sweeping configurations.
 
-### What neither build fixes
+### The variance was co-tenant traffic, not the engine
 
-Earlier in this investigation single requests stalled badly and unpredictably
-(`ITLmax` up to 1,090 ms). With the sampling pinned, 40 consecutive requests
-straight after a restart ran 225.7-240.1 tok/s with **zero** stalls, and the
-disturbance could not be provoked again: 4-way concurrent bursts, a
-20,000-character prefill, thinking-on requests, 1,200-token generations and idle
-gaps from 0 to 90 seconds all left it clean. It concentrates in the first tens of
-requests after some starts and then goes away.
+Most of this investigation was spent chasing decode runs that were 2x slower than
+their neighbours, on both builds. They were other people's requests landing in the
+same batch.
 
-Ten candidate causes were measured and eliminated: the power cap, swap, major page
-faults, PLE host gather, preemption, acceptance variance, prefix caching,
-CUDA-graph misses, TP/EP all-to-all, and disk I/O. The decisive observations were
-that identical work (same byte-identical output, same step count, same acceptance,
-zero preemptions) took 2x the wall time; that the GPU stayed busy at 86-88%
-*during* a stall; that the code prompt stalled while reading 0.0 MB from disk; and
-that PP2, with no TP, no EP and no collectives, stalled the same. Unexplained.
+A watcher probing every 30 s with the pinned request, dumping full engine and host
+state whenever acceptance dropped below 4.5, caught it twice in 41 probes:
+
+| | tok/s | ms/step | acceptance | `prefix_cache_queries` delta |
+|---|---|---|---|---|
+| clean | 217-220 | 21.9 | 4.855 | ~30 |
+| caught (1) | 22.3 | **152.7** | 4.368 | **+37,610** |
+| caught (2) | 161.7 | 14.5 | **3.682** | +28 |
+
+The engine log for the first shows `Avg prompt throughput: 3,758 tokens/s` — a
+large prefill running alongside the probe, which is also what the 37,610 prefix
+lookups are. The gateway logged 14 requests of 5,135 characters in that
+15-minute window. Case (2) is the other shape of the same cause: a request joins
+the batch, the batch stops being uniform, and acceptance falls while the steps
+themselves stay fast.
+
+**`--idle-gate` does not prevent this.** It samples before the probe starts, so
+traffic that arrives mid-request is not excluded. That is why clean runs of 40,
+70 and 90 consecutive probes alternated with occasional collapses, and why
+nothing we did deliberately — bursts, long prefills, thinking-on requests,
+1,200-token generations, idle gaps, cold starts, cache wipes — could reproduce it
+on demand.
+
+Fifteen candidate causes were measured and eliminated before this one was caught:
+the power cap, swap, major page faults, PLE host gather, preemption, prefix
+caching, CUDA-graph misses, TP/EP all-to-all, disk I/O, cold starts, the JIT
+cache, GPU contention from the other cards, `ignore_eos` and generation length,
+concurrency level, and mixing output lengths. None of them mattered. The
+decisive mistake was reading client-side SSE gaps as "stalls": with MTP each
+chunk carries several tokens, so a `300-1,000 ms` gap at the client can be an
+ordinary step boundary. The engine's own `vllm:inter_token_latency_seconds_count`
+is exactly `spec_decode_num_drafts_total` — the step count — and comparing it
+against `_sum` separates "steps got slower" from "there were more steps". Both
+happened, for the same reason.
+
+**What this means for anyone measuring here:** a benchmark on this host is only
+trustworthy if nothing else can reach the engine, or if each sample records its
+`prefix_cache_queries` delta so contaminated samples can be dropped afterwards.
 
 ## Requirements
 
