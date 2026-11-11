@@ -217,57 +217,95 @@ answered in 5 of 6 runs** — about three minutes of nothing each. Send
 Since 2026-11-10 there is a second way to serve this checkpoint: upstream vLLM's
 own wheel plus the [`vllm-cmp170hx`](https://github.com/AlexBrandes/vllm) platform
 plugin, packaged by [AlexBrandes](https://github.com/AlexBrandes/cmp170hx-qwen38-flash-next).
-It beat this repository's build on every axis measured, so the recipe here is kept
-for reference and rollback rather than as the recommendation.
+It is **8-15% faster on every prompt** here, so the recipe in this repository is
+kept for reference and rollback rather than as the recommendation.
 
-Both arms served **the same** heretic-2 W4A16 checkpoint with the same FP8 PLE, the
-same prompts, and `bench/bench.py`'s decode definition (TTFT excluded). Every arm
-idle-gated on `num_requests_running == 0` and took 8 warm-up requests first. Raw
-data: [`results/2026-11-10-upstream-build-comparison.jsonl`](results/2026-11-10-upstream-build-comparison.jsonl).
+Both arms served the same heretic-2 W4A16 checkpoint with the same FP8 PLE, and the
+measurement needed a stricter protocol than the one in [Method](#method) — see
+[Measuring this model honestly](#measuring-this-model-honestly) below, which is the
+most reusable thing in this section. Raw data:
+[`results/2026-11-11-sparkdash-upstream-comparison.jsonl`](results/2026-11-11-sparkdash-upstream-comparison.jsonl).
 
 | | this repository | upstream + plugin |
 |---|---|---|
 | vLLM | `0.1.dev20073+g8e685d198` (a fork; the commit is not in upstream) | `0.33.0rc1.dev659+ga0d7356b9` (official wheel) |
 | 170HX support | patch stack + overlays, pinned to `alesha-pro@9b36aae` | `vllm-cmp170hx 0.2.0` platform plugin |
-| PLE | `VLLM_PLE_CPU_OFFLOAD=1`, 47 GiB resident in host RAM | `--engram-config {"disk_offload":true}`, `preadv` per step, 32-thread gather |
+| PLE | `VLLM_PLE_CPU_OFFLOAD=1`, 47 GiB resident in host RAM | `--engram-config {"disk_offload":true}`, `preadv` per step |
+| host RAM used | 69-70 GiB | **20 GiB** |
 
-### Decode, single stream (tok/s, median of 6)
+### Decode (tok/s, sparkDash protocol, median of 5, zero stalls)
 
-| prompt | this repository | upstream | upstream + nvfp4 draft head |
+| prompt | this repository | upstream + nvfp4 | gain |
 |---|---|---|---|
-| code | 225 | 241 | **266** |
-| en prose | 82 | 79 | **95** |
-| `banana` ×80 | 281 | 895 | **696** (peak 2,151) |
+| ja prose | 92.8 | **100.3** | +8.1% |
+| code | 190.9 | **220.1** | +15.3% |
+| en prose | 108.4 | **121.3** | +11.9% |
+| ja list | 97.5 | **112.5** | +15.4% |
 
-Acceptance length is the same on both builds, so these are engine-side gains, not
-better drafting. The `banana` row is the clean case: `ms/step` falls from 5.7 to
-**2.3 ms**.
+Both arms run TP2 + expert parallel, `max-num-seqs 12`,
+`max-num-batched-tokens 4096`, MTP k=4. The only change on the upstream side is
+one speculative-config field:
 
-### Concurrency (aggregate tok/s, best of 3, 400-token answers)
+```
+--speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_lm_head_quantization":"nvfp4"}'
+```
 
-| concurrent | this repository | stalls | upstream | stalls |
-|---:|---:|---:|---:|---:|
-| 1 | 213.6 | 0 | **310.9** | 0 |
-| 3 | 511.3 | 0 | **776.4** | 0 |
-| 4 | 449.8 | **6** | **673.8** | 0 |
-| 6 | 455.7 | **16** | **848.4** | 0 |
-| 8 | 863.8 | **10** | **992.9** | 0 |
-| 9 | 1042.3 | 0 | **1378.3** | 0 |
-| 11 | 945.5 | **6** | **1106.4** | 0 |
+`draft_lm_head_quantization` quantizes the drafter's copy of the shared `lm_head`;
+the target still verifies with its own head, so acceptance length does not move
+(4.855 either way) and output quality cannot change.
 
-The dips at 4, 6, 8 and 11 concurrent requests are exactly where this build stalls.
-On the upstream build those stalls do not happen at any level: `ITLmax` stays
-23–64 ms throughout. Peak is **1,378 tok/s at 9 concurrent**.
+### What actually produced the gain
 
-### `--pipeline-parallel-size 2` works there, and is still slower
+One variable at a time on the upstream image, code prompt, 12 repetitions each:
 
-[Things that did not help](#things-that-did-not-help) records that PP is refused
-here, because `VLLM_PLE_CPU_OFFLOAD` rejects `pipeline_parallel_size != 1`.
-Upstream's `disk_offload` carries no such restriction, so TP1 + PP2 with expert
-parallel **off** boots normally — VRAM splits 51,152 / 59,168 MiB, and the quant
-divisibility that forces EP under TP2 stops mattering because PP splits layers, not
-`moe_intermediate`. It is still 5% slower than TP2 + EP (code 252.5 against 266.4,
-en prose 87.9 against 93.2), so TP2 + EP stays the right choice on these cards.
+| step | tok/s | Δ | acceptance | ms/step |
+|---|---|---|---|---|
+| A  TP2+EP, k=4, nbt 4096, seqs 12, `FULL_DECODE_ONLY` | 209.7 | — | 4.855 | 22.9 |
+| B  A + `draft_lm_head_quantization: nvfp4` | 220.6 | **+5.2%** | 4.855 | 21.8 |
+| C  B + k=5 + `--block-size 1680` | 230.8 | **+4.6%** | 5.493 | 23.7 |
+| D  C + `cudagraph_mode: FULL_AND_PIECEWISE` | 231.9 | +0.5% | 5.493 | 23.6 |
+| E  full AlexBrandes config: + PP2, seqs 8, nbt 2048 | 232.2 | +0.1% | 5.493 | 23.5 |
+
+**`nvfp4` and k=5 account for all of it.** Pipeline parallel, `max-num-seqs 8`,
+`max-num-batched-tokens 2048` and `FULL_AND_PIECEWISE` contribute nothing
+measurable on these cards — which is worth knowing, because PP2 is the headline
+difference in the upstream recipe and the expensive one to adopt. (Measured
+separately, PP2 is 5% *slower* than TP2+EP here.)
+
+### k=5 is a code-only optimisation
+
+The ablation above used the code prompt, where a longer draft pays. Across all
+four prompts it does not:
+
+| prompt | upstream k=4 | upstream k=5 | |
+|---|---|---|---|
+| ja prose | **100.3** | 95.8 | −4.5% |
+| code | 220.1 | **229.7** | +4.4% |
+| en prose | **121.3** | 116.1 | −4.3% |
+| ja list | **112.5** | 101.8 | −9.5% |
+
+Acceptance is 4.86-5.49 on code and only 2.2-2.9 on prose, so drafting five
+tokens ahead wins on code and wastes work everywhere else — the same thing
+[Results](#results) already said about larger k, now measured on both builds.
+**Keep k=4 for mixed traffic.** k=5 is worth it only for a code-only endpoint,
+and then it needs the block size below.
+
+### `k >= 5` needs `--block-size 1680`
+
+Raising k past 4 fails at startup with
+
+```
+AssertionError: QSA ring capacity 12 must divide the attention block size 1616
+```
+
+`qsa_cache.py` here (`qsa_indexer.py` upstream) sizes the QSA ring as
+`round_up(compress_ratio + num_speculative_tokens, compress_ratio)` and asserts
+that the attention block size divides it. `compress_ratio` is 4, so k≤4 gives
+capacity 8, which the default block size 1616 divides; k=5 gives capacity 12,
+which it does not. `--block-size 1680` (1680 / 12 = 140) fixes it. This is why the
+upstream recipe carries `--block-size 1680`, and it applies to **this** build too:
+`SPEC='{"method":"mtp","num_speculative_tokens":5}' EXTRA_ARGS='--block-size 1680'
+./scripts/run.sh` reaches 205.4 tok/s on code without changing images at all.
 
 ### `tool_choice` is broken here and fixed there
 
@@ -278,68 +316,93 @@ en prose 87.9 against 93.2), so TP2 + EP stays the right choice on these cards.
 | xgrammar `Failed to advance FSM` + matcher warnings | **215** | **0** in 55 requests |
 
 On this build `tool_choice: "required"` silently degrades to `auto`, and
-`finish_reason` is still rewritten to `"tool_calls"` while `tool_calls` stays empty —
-a self-contradictory response that breaks any client trusting `finish_reason`.
-The cause: `VLLM_ENFORCE_STRICT_TOOL_CALLING` defaults to `True`, which sets
-`supports_required_and_named = False` on any parser carrying a
+`finish_reason` is still rewritten to `"tool_calls"` while `tool_calls` stays
+empty — a self-contradictory response that breaks any client trusting
+`finish_reason`. The cause: `VLLM_ENFORCE_STRICT_TOOL_CALLING` defaults to `True`,
+which sets `supports_required_and_named = False` on any parser carrying a
 `structural_tag_model` (ours does, `qwen_3_coder`), so required and named tool
-choice fall back to the `auto` path; and the grammar that should have enforced it is
-built with `reasoning=False` hardcoded, which demands `<tool_call>` as the very
+choice fall back to the `auto` path; and the grammar that should have enforced it
+is built with `reasoning=False` hardcoded, which demands `<tool_call>` as the very
 first output and therefore cannot match a thinking model. Upstream's
 `ToolStrictLevel` and `constraint_start` resolve both.
 
-### Where the memory goes, on the other build
+### Measuring this model honestly
 
-| | this repository | upstream |
-|---|---|---|
-| host RAM used | 69–70 GiB | **20 GiB** |
-| host RAM available | 53 GiB | **103 GiB** |
-| VRAM per card | 61,545 MiB | 59,536 MiB |
+The numbers above needed three disciplines that [Method](#method) does not use.
+Without them this comparison was unrepeatable — the same cell swung 2x — and the
+first conclusions drawn from it were wrong.
 
-`disk_offload` reads each step's PLE rows with `preadv` instead of holding the table,
-so the 47 GiB comes back to the host. Measured read load peaks at **2.4 MB/s** —
-the code prompt reads 0.0–0.4 MB per request — against a PCIe 4.0 ×4 link, with
-only 5–21% of the 47.7 GiB table resident in page cache. Contention is not a
-throughput risk, but the table now lives on its own NVMe here anyway, so
-distillation and video generation can share the host again.
+**Pin the sampling.** MTP acceptance is content-dependent on this model, so
+`temperature 0.7` with thinking on and a natural stop length makes every
+repetition generate different text at a different length, at a different speed.
+The [sparkDash](https://github.com/MiaAI-Lab/sparkDash) protocol at `3e6d4ef` —
+the one the upstream recipe publishes its numbers with — pins all three:
+`temperature 0`, `top_p 1`, thinking off, and the length fixed with `min_tokens`
+plus `ignore_eos`. The tok/s formula is identical to ours. `bench/bench.py
+--protocol sparkdash` now does this; the spread drops from 25-80% to 0.4-9.6% and
+the output becomes byte-identical between repetitions.
 
-One trap: right after moving the table to another disk the numbers look bad (code
-40–53 tok/s) purely because page cache is cold. Residency climbed 5.1% → 21.3% over
-a few minutes and decode returned to 268–287. **Wait for the cache before measuring.**
+**Gate on an idle engine.** `bench/bench.py --idle-gate` waits for
+`num_requests_running` and `num_requests_waiting` to read zero before every
+measured request. Anything else reaching the server — the LiteLLM gateway in
+`gateway/`, an agent, a dashboard — joins the batch, changes the shape, and
+depresses the rate silently. Several readings taken before this existed were
+contaminated and had to be thrown away.
 
-### `draft_lm_head_quantization`
+**Throw away the first set after a start.** Decode climbs over the first tens of
+requests and is erratic until it settles. One measurement set straight after a
+start showed the code prompt at 102.9% spread with 10 stalls; re-running it on the
+same container, unchanged, gave 0.4% spread and zero stalls. `--warmup 8` helps but
+is not sufficient on its own.
 
-Upstream takes one config line to quantize the drafter's copy of the shared
-`lm_head`, which this build has no equivalent for:
+A fourth, cheaper note: `docker restart` reaches `/health` in under three minutes
+against roughly twelve for a fresh `run`, because the JIT and inductor caches
+survive in `models/.vllm-cache`. Use it when sweeping configurations.
 
-```
---speculative-config '{"method":"mtp","num_speculative_tokens":4,"draft_lm_head_quantization":"nvfp4"}'
-```
+### The variance was co-tenant traffic, not the engine
 
-Measured on and off, same build: code 240.8 → **266.4** (+10.6%), en prose
-78.8 → **94.9** (+20.5%). Acceptance length does not move, which is what upstream
-documents — the target still verifies with its own head.
+Most of this investigation was spent chasing decode runs that were 2x slower than
+their neighbours, on both builds. They were other people's requests landing in the
+same batch.
 
-### What neither build fixes
+A watcher probing every 30 s with the pinned request, dumping full engine and host
+state whenever acceptance dropped below 4.5, caught it twice in 41 probes:
 
-Single requests stall on both. The en-prose prompt stalls in nearly every run
-(3–14 occurrences, `ITLmax` 332–1,090 ms) while `ms/step` p50 holds a steady
-25–31 ms. Ten candidates were measured and eliminated: the power cap, swap, major
-page faults, PLE host gather, preemption, acceptance variance, prefix caching,
-CUDA-graph misses, TP/EP all-to-all, and disk I/O.
+| | tok/s | ms/step | acceptance | `prefix_cache_queries` delta |
+|---|---|---|---|---|
+| clean | 217-220 | 21.9 | 4.855 | ~30 |
+| caught (1) | 22.3 | **152.7** | 4.368 | **+37,610** |
+| caught (2) | 161.7 | 14.5 | **3.682** | +28 |
 
-What the measurements say: the work per request is identical (~35 steps, ~4.8
-tokens/step, 0 preemptions) while wall time spreads 6×; the GPU is busy at 86–88%
-*during* a stall; slow runs burn 2–3× more CPU; the code prompt stalls while reading
-**0.0 MB** from disk; and PP2 — no TP, no EP, no all-to-all — stalls the same. It
-tracks prompt content: `banana` ×80 almost never stalls, en prose almost always
-does. That points at the kernels or the routing rather than at configuration, and it
-is unexplained.
+The engine log for the first shows `Avg prompt throughput: 3,758 tokens/s` — a
+large prefill running alongside the probe, which is also what the 37,610 prefix
+lookups are. The gateway logged 14 requests of 5,135 characters in that
+15-minute window. Case (2) is the other shape of the same cause: a request joins
+the batch, the batch stops being uniform, and acceptance falls while the steps
+themselves stay fast.
 
-En prose is also slow for a second, fully explained reason: acceptance length is
-2.45–2.75 against 4.5–4.8 for code and `banana`. The MTP head served here was
-distilled on this model's own **Japanese** answers, so English prose does not draft
-well. No build change fixes that; re-distilling with English data would.
+**`--idle-gate` does not prevent this.** It samples before the probe starts, so
+traffic that arrives mid-request is not excluded. That is why clean runs of 40,
+70 and 90 consecutive probes alternated with occasional collapses, and why
+nothing we did deliberately — bursts, long prefills, thinking-on requests,
+1,200-token generations, idle gaps, cold starts, cache wipes — could reproduce it
+on demand.
+
+Fifteen candidate causes were measured and eliminated before this one was caught:
+the power cap, swap, major page faults, PLE host gather, preemption, prefix
+caching, CUDA-graph misses, TP/EP all-to-all, disk I/O, cold starts, the JIT
+cache, GPU contention from the other cards, `ignore_eos` and generation length,
+concurrency level, and mixing output lengths. None of them mattered. The
+decisive mistake was reading client-side SSE gaps as "stalls": with MTP each
+chunk carries several tokens, so a `300-1,000 ms` gap at the client can be an
+ordinary step boundary. The engine's own `vllm:inter_token_latency_seconds_count`
+is exactly `spec_decode_num_drafts_total` — the step count — and comparing it
+against `_sum` separates "steps got slower" from "there were more steps". Both
+happened, for the same reason.
+
+**What this means for anyone measuring here:** a benchmark on this host is only
+trustworthy if nothing else can reach the engine, or if each sample records its
+`prefix_cache_queries` delta so contaminated samples can be dropped afterwards.
 
 ## Requirements
 
